@@ -8,15 +8,27 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, models
 import matplotlib.pyplot as plt
+import re # Added for regular expressions
+import importlib.util # Added for robust module import
 
-# Corrected: Add the directory containing the 'dvae' module directly to sys.path
-module_path = '/content/drive/MyDrive'
-if module_path not in sys.path:
-    sys.path.append(module_path)
+# Define the path where dvae.py is located
+module_path = '/content/drive/MyDrive/NonlinearMemory'
+module_name = 'dvae'
+file_path = os.path.join(module_path, f'{module_name}.py')
 
-# Corrected: Import Sampling and DVAE directly from the 'dvae' module
-from dvae import Sampling
-from dvae import DVAE
+# Create a module spec from the file path
+spec = importlib.util.spec_from_file_location(module_name, file_path)
+if spec is None:
+    raise ModuleNotFoundError(f"Cannot find {module_name}.py at {file_path}")
+
+# Load the module
+dvae_module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = dvae_module
+spec.loader.exec_module(dvae_module)
+
+# Import Sampling and DVAE directly from the loaded module
+Sampling = dvae_module.Sampling
+DVAE = dvae_module.DVAE
 
 # 훈련 시와 동일한 정규화 함수 추가
 def normalize_with_rms(I_data, Q_data):
@@ -134,9 +146,9 @@ signal_bw = 0.2 # normalized bandwidth fraction for ACPR calc
 # -------------------------
 # 4) Model: Conv1D + LSTM DVAE
 # -------------------------
-latent_dim = N  # 잠재 공간의 차원
-beta_kl = 1e-3  # KL weight (tune)
-batch_size = N  # 훈련 시 한 번에 처리되는 샘플의 수
+latent_dim = N * 2  # 잠재 공간의 차원
+beta_kl = 1e-6  # KL weight (tune)
+batch_size = N * 2 # 훈련 시 한 번에 처리되는 샘플의 수
 
 file1_I	 = '/content/drive/MyDrive/input_iq_I.csv'
 file1_Q	 = '/content/drive/MyDrive/input_iq_Q.csv'
@@ -248,34 +260,82 @@ vae = models.Model(enc_in, dec_out, name="IQ_Conv1D_LSTM_DVAE")
 dvae = DVAE(encoder, decoder, beta=beta_kl)
 dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3))
 
+# --- MODIFIED PART FOR RESUMING TRAINING ---
+model_dir = '/content/drive/MyDrive/NonlinearMemory/'
+saved_models = [f for f in os.listdir(model_dir) if f.startswith('my_dvae_model_') and f.endswith('.keras')]
+latest_epoch = 0
+latest_model_path = None
+
+if saved_models:
+    epoch_numbers = []
+    for model_file in saved_models:
+        match = re.search(r'my_dvae_model_(\d+)\.keras', model_file)
+        if match:
+            epoch_numbers.append(int(match.group(1)))
+
+    if epoch_numbers:
+        latest_epoch = max(epoch_numbers)
+        latest_model_path = os.path.join(model_dir, f'my_dvae_model_{latest_epoch}.keras')
+
+        print(f"Latest saved model found: {latest_model_path}. Loading model to resume training.")
+        # Ensure DVAE and Sampling classes are available for custom_objects
+        dvae = models.load_model(latest_model_path, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
+        dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3)) # Recompile after loading
+        print(f"Resuming training from total epochs: {latest_epoch}.")
+    else:
+        print("No parsable DVAE models found in the directory. Starting new training.")
+else:
+    print("No saved DVAE models found. Starting new training.")
+
 # -------------------------
 # 5) Training
-# history = dvae.fit(x=X_in_train_ch, y=X_out_train_ch, validation_data=(X_in_val_ch, X_out_val_ch), epochs=30, batch_size=32)
-# -------------------------
-epoch_num=[1, 1, 1, 2, 5, 10, 10, 10, 10, 10] #, 10, 10, 10, 10] #, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
-epoch_num2=[1, 2, 3, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] #,150,200,250,300,350,400,450,500,550,600,650,700]
-for idx in range(0,len(epoch_num)):
+# epoch_num defines how many epochs to run in each segment (e.g., [5, 5, ...])
+# epoch_num2 defines the *cumulative* epoch number for saving (e.g., [5, 10, ...])
+
+epoch_num = [5] * 20
+epoch_num2 = [i * 5 for i in range(1, 21)]
+
+# Adjust the loop to start from the correct point if resuming
+start_idx = 0
+if latest_epoch > 0:
+    try:
+        # Find the index in epoch_num2 that corresponds to the latest_epoch
+        # We need to start training *after* this epoch has completed.
+        # So, if latest_epoch is 15, and epoch_num2 is [5, 10, 15, 20, ...],
+        # we want to start from the index *after* 15 (which is for 20).
+        start_idx = epoch_num2.index(latest_epoch)
+        # If the latest_epoch was exactly one of the target_save_epoch_total, then we continue from the next segment.
+        if start_idx < len(epoch_num2) - 1 and epoch_num2[start_idx] == latest_epoch:
+            start_idx += 1
+        print(f"Training will continue from the segment after {latest_epoch} total epochs.")
+    except ValueError:
+        print(f"Warning: Latest epoch {latest_epoch} not found in saving schedule (epoch_num2). Starting from the beginning of the schedule.")
+        start_idx = 0
+
+for idx in range(start_idx, len(epoch_num)):
+  current_epochs_to_run = epoch_num[idx]
+  target_save_epoch_total = epoch_num2[idx]
+
+  print(f"\n--- Training for {current_epochs_to_run} epochs (cumulative total: {target_save_epoch_total} epochs) ---")
   history = dvae.fit(
     x=X_in_train_ch,
     y=X_out_train_ch,
     validation_data=(X_in_val_ch, X_out_val_ch),
-    epochs=epoch_num[idx],
+    epochs=current_epochs_to_run,
     batch_size=batch_size
   )
 
-  # 모델을 .keras 파일로 저장하는 예시
-  model_save_path_keras = '/content/drive/MyDrive/NonlinearMemory/my_dvae_model_' + str(epoch_num2[idx]) + '.keras'
+  model_save_path_keras = os.path.join(model_dir, f'my_dvae_model_{target_save_epoch_total}.keras')
   dvae.save(model_save_path_keras) # 확장자를 .keras로 변경
   print(f'DVAE 모델이 {model_save_path_keras}에 저장되었습니다.')
   print("evaluate shape: ", X_in_test_ch.shape, X_out_test_ch.shape)
   dvae.evaluate(X_in_test_ch, X_out_test_ch)
 
-  # Update the name variable to point to the new model file
-  name = model_save_path_keras
+  # The original code loaded the just-saved model into `loaded_dvae_keras` but did not use it for subsequent training.
+  # Removing the redundant load as `dvae` is already the live, updated model.
+  # If a restart happens, the initial logic at the top of the cell will handle loading the latest model.
 
-  # Now, try loading the newly saved model
-  loaded_dvae_keras = models.load_model(name, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
-  print(f'New DVAE model successfully loaded from {name}.')
+# --- END MODIFIED PART ---
 
 # -------------------------
 # 6) Evaluation on test set
