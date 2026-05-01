@@ -1,5 +1,5 @@
-# IQ_Conv1D_DPD_Deterministic.py
-# Improved Deterministic DPD (SOTA-style)
+# IQ_Conv1D_DVAE_with_LSTM.py
+# Keras/TensorFlow implementation of Conv1D + LSTM DVAE for complex IQ signals
 
 import os
 import numpy as np
@@ -8,161 +8,343 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 import re # Added for regular expressions
 
-# --------------------------------------------------
-# 1. Utilities
-# --------------------------------------------------
+# -------------------------
+# 1) Utilities
+# -------------------------
 
-def normalize_pair(I, Q, ref_rms=None):
-    mag = np.sqrt(I**2 + Q**2)
-    if ref_rms is None:
-        ref_rms = np.sqrt(np.mean(mag**2) + 1e-12)
-    return I/ref_rms, Q/ref_rms, ref_rms
+def normalize_with_rms(I_data, Q_data):
+    magnitude = np.sqrt(I_data**2 + Q_data**2)
+    rms = np.sqrt(np.mean(magnitude**2))
+    if rms > 0:
+        return I_data/rms, Q_data/rms, rms
+    return I_data, Q_data, 1.0
+    
+# ---------------------------------
+# Complex IQ -> 2 channel
+# ---------------------------------
+def to_2ch(x):
+    return np.stack([np.real(x), np.imag(x)], axis=-1)
 
-def to_2ch(i, q):
+def to_1ch(i, q):
     return np.stack([i, q], axis=-1).astype(np.float32)
 
-def to_complex(x2):
-    return x2[...,0] + 1j*x2[...,1]
+# convert to complex
+def to_complex(x2ch):
+    return x2ch[...,0] + 1j * x2ch[...,1]
 
-# --------------------------------------------------
-# 2. Complex NMSE loss (DPD-friendly)
-# --------------------------------------------------
+# ---------------------------------
+# Sampling Layer (Reparameterization)
+# ---------------------------------
+class Sampling(layers.Layer):
 
-def complex_nmse_loss(y_true, y_pred):
-    err = y_true - y_pred
-    power = tf.reduce_mean(tf.square(y_true))
-    return tf.reduce_mean(tf.square(err)) / (power + 1e-9)
+    def call(self, inputs):
 
-# --------------------------------------------------
-# 3. Deterministic DPD Model (SOTA-style)
-# --------------------------------------------------
+        z_mean, z_log_var = inputs
 
-def build_dpd_model(seq_len):
+        epsilon = tf.random.normal(shape=tf.shape(z_mean))
 
-    inp = layers.Input(shape=(seq_len, 2))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
-    x = layers.Conv1D(256, 7, padding="same", activation="relu")(inp)
-    x = layers.Conv1D(256, 7, padding="same", activation="relu")(x)
 
-    x = layers.LSTM(256, return_sequences=True)(x)
+# ---------------------------------
+# Encoder
+# ---------------------------------
+def build_encoder(seq_len):
 
-    x = layers.Conv1D(128, 5, padding="same", activation="relu")(x)
-    x = layers.Conv1D(64, 3, padding="same", activation="relu")(x)
+    inputs = layers.Input(shape=(seq_len,2))
 
-    correction = layers.Conv1D(2, 1, padding="same")(x)
+    x = layers.Conv1D(64,5,padding="same",activation="relu")(inputs)
+    x = layers.Conv1D(64,5,padding="same",activation="relu")(x)
 
-    # residual scaling (IMPORTANT)
-    correction = layers.Lambda(lambda t: 0.1 * t)(correction)
+    x = layers.Bidirectional(
+        layers.LSTM(128, return_sequences=False)
+    )(x)
 
-    out = layers.Add()([inp, correction])
+    z_mean = layers.Dense(64)(x)
+    z_log_var = layers.Dense(64)(x)
 
-    return models.Model(inp, out, name="SOTA_DPD")
+    return models.Model(inputs,[z_mean,z_log_var])
 
-# --------------------------------------------------
-# 4. Data Loading
-# --------------------------------------------------
 
-seq_len = 64
-batch_size = 64
+# ---------------------------------
+# Decoder
+# ---------------------------------
+def build_decoder(seq_len, channels=2, latent_dim=64):
 
-file1_I = '/content/drive/MyDrive/input_iq_I.csv'
-file1_Q = '/content/drive/MyDrive/input_iq_Q.csv'
-file2_I = '/content/drive/MyDrive/input_target_I.csv'
-file2_Q = '/content/drive/MyDrive/input_target_Q.csv'
+    latent_inputs = layers.Input(shape=(latent_dim,))
 
-# load csv
-in_I = pd.read_csv(file1_I,header=None).to_numpy()
-in_Q = pd.read_csv(file1_Q,header=None).to_numpy()
-t_I  =  pd.read_csv(file2_I,header=None).to_numpy()
-t_Q  =  pd.read_csv(file2_Q,header=None).to_numpy()
+    x = layers.Dense(seq_len*64,activation="relu")(latent_inputs)
+
+    x = layers.Reshape((seq_len,64))(x)
+
+    x = layers.Conv1D(64,5,padding="same",activation="relu")(x)
+    x = layers.Conv1D(32,5,padding="same",activation="relu")(x)
+
+    outputs = layers.Conv1D(channels,1,padding="same")(x)
+
+    return models.Model(latent_inputs,outputs,name="decoder")
+
+
+# ---------------------------------
+# DVAE Model (DPD version)
+# ---------------------------------
+class DVAE(tf.keras.Model):
+
+    def __init__(self, encoder, decoder, beta=0.001, **kwargs):
+
+        super(DVAE,self).__init__(**kwargs)
+
+        self.encoder = encoder
+        self.decoder = decoder
+        self.beta = beta
+
+        self.sampling = Sampling()
+
+    # Add get_config to serialize the model
+    def get_config(self):
+        config = super().get_config()
+        # Save the configurations of the sub-models
+        config.update({
+            "encoder_config": self.encoder.get_config(),
+            "decoder_config": self.decoder.get_config(),
+            "beta": self.beta,
+        })
+        return config
+
+    # Add from_config to deserialize the model
+    @classmethod
+    def from_config(cls, config, custom_objects=None):
+        beta = config.pop("beta", 1e-3)
+        encoder_config_dict = config.pop("encoder_config")
+        decoder_config_dict = config.pop("decoder_config")
+
+        # Make sure custom_objects are passed to sub-model deserialization
+        if custom_objects is None:
+            custom_objects = {}
+        # Ensure Sampling layer is recognized during sub-model deserialization
+        custom_objects['Sampling'] = Sampling
+
+        # Reconstruct encoder and decoder using Model.from_config
+        reconstructed_encoder = tf.keras.models.Model.from_config(encoder_config_dict, custom_objects=custom_objects)
+        reconstructed_decoder = tf.keras.models.Model.from_config(decoder_config_dict, custom_objects=custom_objects)
+
+        # Instantiate the DVAE class with the reconstructed sub-models and beta
+        return cls(encoder=reconstructed_encoder, decoder=reconstructed_decoder, beta=beta, **config)
+            
+    def call(self,inputs,training=False):
+
+        z_mean,z_log_var = self.encoder(inputs)
+
+        if training:
+            z = self.sampling([z_mean,z_log_var])
+        else:
+            z = z_mean
+
+        correction = self.decoder(z)
+
+        # residual predistortion
+        outputs = inputs + correction
+
+        return outputs,z_mean,z_log_var
+
+
+    def train_step(self,data):
+
+        x,y = data
+
+        with tf.GradientTape() as tape:
+
+            y_pred,z_mean,z_log_var = self(x,training=True)
+
+            recon_loss = tf.reduce_mean(
+                tf.square(y - y_pred)
+            )
+
+            kl_loss = -0.5 * tf.reduce_mean(
+                1 + z_log_var
+                - tf.square(z_mean)
+                - tf.exp(z_log_var)
+            )
+
+            loss = recon_loss + self.beta * kl_loss
+
+        grads = tape.gradient(loss,self.trainable_weights)
+
+        self.optimizer.apply_gradients(
+            zip(grads,self.trainable_weights)
+        )
+
+        return {
+            "loss":loss,
+            "recon_loss":recon_loss,
+            "kl_loss":kl_loss
+        }
+
+    def test_step(self, data):
+        # 1. 데이터 분리 (x: 입력, y: 타겟)
+        x, y = data
+        
+        # 2. call() 메서드를 활용하여 일관성 유지
+        # 이렇게 하면 내부적으로 encoder -> sampling -> decoder 과정이 자동으로 수행됩니다.
+        y_pred, z_mean, z_log_var = self(x, training=False)
+
+        # 3. 손실 계산
+        recon_loss = tf.reduce_mean(tf.square(y - y_pred))
+        kl_loss = -0.5 * tf.reduce_mean(
+            1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)
+        )
+        loss = recon_loss + self.beta * kl_loss
+
+        # 4. 결과 반환 (loss_tracker가 없어도 Keras가 자동으로 처리하도록 딕셔너리 반환)
+        return {
+            "loss": loss,
+            "recon_loss": recon_loss,
+            "kl_loss": kl_loss
+        }
+
+# ---------------------------------
+# Model Build
+# ---------------------------------
+N = 64
+seq_len = N
+beta_kl = 1e-3  # KL weight (tune)
+batch_size = N * 2 # 훈련 시 한 번에 처리되는 샘플의 수
+
+file1_I	 = '/content/drive/MyDrive/input_iq_I.csv'
+file1_Q	 = '/content/drive/MyDrive/input_iq_Q.csv'
+
+file2_I	 = '/content/drive/MyDrive/input_target_I.csv'
+file2_Q	 = '/content/drive/MyDrive/input_target_Q.csv'
+
+inputData_I = pd.read_csv(file1_I,header=None)
+inputData_Q = pd.read_csv(file1_Q,header=None)
+outputData_I = pd.read_csv(file2_I,header=None)
+outputData_Q = pd.read_csv(file2_Q,header=None)
+print(f"Initial outputData_I shape (from CSV): {outputData_I.shape}")
+print(f"Initial outputData_Q shape (from CSV): {outputData_Q.shape}")
+
+print("Complete import data")
+inputData_I = inputData_I.to_numpy()
+inputData_Q = inputData_Q.to_numpy()
+outputData_I = outputData_I.to_numpy()
+outputData_Q = outputData_Q.to_numpy()
+
+print(f"Shape of inputData_I after to_numpy(): {inputData_I.shape}")
+print(f"Shape of outputData_I after to_numpy(): {outputData_I.shape}")
 
 # Reshape data to (num_sequences, seq_len)
 # Assuming original numpy arrays are (total_samples, 1)
-num_total_samples_I = in_I.shape[0]
+num_total_samples_I = inputData_I.shape[0]
 if num_total_samples_I % seq_len != 0:
     raise ValueError(f"Total samples for I ({num_total_samples_I}) must be divisible by seq_len ({seq_len}) for reshaping.")
 
-num_total_samples_Q = in_Q.shape[0]
+num_total_samples_Q = inputData_Q.shape[0]
 if num_total_samples_Q % seq_len != 0:
-    raise ValueError(f"Total samples for Q ({num_total_samples_Q}) must be divisible by seq_len ({seq_len})
-    
-# reshape
-in_I = in_I.reshape(-1, seq_len)
-in_Q = in_Q.reshape(-1, seq_len)
-t_I  = t_I.reshape(-1, seq_len)
-t_Q  = t_Q.reshape(-1, seq_len)
+    raise ValueError(f"Total samples for Q ({num_total_samples_Q}) must be divisible by seq_len ({seq_len}) for reshaping.")
 
-# split
-N = in_I.shape[0]
-n_train = int(0.8*N)
-n_val   = int(0.1*N)
+inputData_I = inputData_I.reshape(-1, seq_len)
+inputData_Q = inputData_Q.reshape(-1, seq_len)
+outputData_I = outputData_I.reshape(-1, seq_len)
+outputData_Q = outputData_Q.reshape(-1, seq_len)
 
-I_tr, Q_tr = in_I[:n_train], in_Q[:n_train]
-I_va, Q_va = in_I[n_train:n_train+n_val], in_Q[n_train:n_train+n_val]
-I_te, Q_te = in_I[n_train+n_val:], in_Q[n_train+n_val:]
+# Now, len_i, len_q, etc. should represent the number of *sequences*
+len_i = inputData_I.shape[0] # Number of sequences
+len_q = inputData_Q.shape[0]
+len_o_I = outputData_I.shape[0]
+len_o_Q = outputData_Q.shape[0]
 
-tI_tr, tQ_tr = t_I[:n_train], t_Q[:n_train]
-tI_va, tQ_va = t_I[n_train:n_train+n_val], t_Q[n_train:n_train+n_val]
-tI_te, tQ_te = t_I[n_train+n_val:], t_Q[n_train+n_val:]
+print("----------------------------")
+print(f"Shape of inputData_I after reshape: {inputData_I.shape}, Number of sequences (len_i): {len_i}")
+print(f"Shape of inputData_Q after reshape: {inputData_Q.shape}, Number of sequences (len_q): {len_q}")
+print(f"Shape of outputData_I after reshape: {outputData_I.shape}, Number of sequences (len_o_I): {len_o_I}")
+print(f"Shape of outputData_Q after reshape: {outputData_Q.shape}, Number of sequences (len_o_Q): {len_o_Q}")
+print("----------------------------")
 
-# RMS normalization (CRITICAL FIX)
-I_tr, Q_tr, rms = normalize_pair(I_tr, Q_tr)
-tI_tr, tQ_tr, _ = normalize_pair(tI_tr, tQ_tr, rms)
+# train/test split - ensure n_train and n_val are based on number of sequences
+n_val = int(0.1 * len_i)
+n_train = int(0.8 * len_i) # Define n_train for consistent splitting
 
-I_va, Q_va, _ = normalize_pair(I_va, Q_va, rms)
-tI_va, tQ_va, _ = normalize_pair(tI_va, tQ_va, rms)
+inputData_I_train = inputData_I[0:n_train]
+inputData_I_val = inputData_I[n_train: n_train + n_val]
+inputData_I_test = inputData_I[n_train + n_val: ]
+inputData_Q_train = inputData_Q[0:n_train]
+inputData_Q_val = inputData_Q[n_train: n_train + n_val]
+inputData_Q_test = inputData_Q[n_train + n_val: ]
 
-I_te, Q_te, _ = normalize_pair(I_te, Q_te, rms)
-tI_te, tQ_te, _ = normalize_pair(tI_te, tQ_te, rms)
+outputData_train_I = outputData_I[0:n_train]
+outputData_train_Q = outputData_Q[0:n_train]
+outputData_val_I = outputData_I[n_train: n_train + n_val]
+outputData_val_Q = outputData_Q[n_train: n_train + n_val]
+outputData_test_I = outputData_I[n_train + n_val: ]
+outputData_test_Q = outputData_Q[n_train + n_val: ]
 
-X_tr = to_2ch(I_tr, Q_tr)
-Y_tr = to_2ch(tI_tr, tQ_tr)
+# Capture the third return value (rms_magnitude)
+inputData_I_train, inputData_Q_train, _ = normalize_with_rms(inputData_I_train, inputData_Q_train)
+inputData_I_val, inputData_Q_val, _ = normalize_with_rms(inputData_I_val, inputData_Q_val)
+inputData_I_test, inputData_Q_test, _ = normalize_with_rms(inputData_I_test, inputData_Q_test)
+target_I_train, target_Q_train, _ = normalize_with_rms(outputData_train_I, outputData_train_Q)
+target_I_val, target_Q_val, _ = normalize_with_rms(outputData_val_I, outputData_val_Q)
+target_I_test, target_Q_test, _ = normalize_with_rms(outputData_test_I, outputData_test_Q)
 
-X_va = to_2ch(I_va, Q_va)
-Y_va = to_2ch(tI_va, tQ_va)
+print(f"Shape of inputData_I_train after split and norm: {inputData_I_train.shape}")
+print(f"Shape of target_I_train after split and norm: {target_I_train.shape}")
 
-X_te = to_2ch(I_te, Q_te)
-Y_te = to_2ch(tI_te, tQ_te)
+X_in_train_ch = to_1ch(inputData_I_train, inputData_Q_train)
+X_out_train_ch = to_1ch(target_I_train, target_Q_train)
+X_in_val_ch = to_1ch(inputData_I_val, inputData_Q_val)
+X_out_val_ch = to_1ch(target_I_val, target_Q_val)
+X_in_test_ch = to_1ch(inputData_I_test, inputData_Q_test)
+X_out_test_ch = to_1ch(target_I_test, target_Q_test)
 
-# --------------------------------------------------
-# 5. Train
-# --------------------------------------------------
+print("Shapes of final training data (X_out_train_ch, X_in_train_ch) *before* fit:")
+print(f"X_out_train_ch.shape: {X_out_train_ch.shape}, X_in_train_ch.shape: {X_in_train_ch.shape}")
 
-model = build_dpd_model(seq_len)
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(2e-4),
-    loss=complex_nmse_loss
+encoder = build_encoder(seq_len)
+decoder = build_decoder(seq_len)
+
+dvae = DVAE(encoder,decoder,beta=beta_kl)
+
+dvae.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3)
 )
 
-model.summary()
+dvae.build((None,seq_len,2))
 
+dvae.summary()
+
+
+# ---------------------------------
+# Example Training Data
+# ---------------------------------
 # --- MODIFIED PART FOR RESUMING TRAINING ---
 model_dir = '/content/drive/MyDrive/NonlinearMemory/'
-saved_models = [f for f in os.listdir(model_dir) if f.startswith('my_dpd_model_') and f.endswith('.keras')] # Changed prefix
+saved_models = [f for f in os.listdir(model_dir) if f.startswith('my_dvae_model_') and f.endswith('.keras')]
 latest_epoch = 0
 latest_model_path = None
 
 if saved_models:
     epoch_numbers = []
     for model_file in saved_models:
-        match = re.search(r'my_dpd_model_(\d+)\.keras', model_file) # Changed regex
+        match = re.search(r'my_dvae_model_(\d+)\.keras', model_file)
         if match:
             epoch_numbers.append(int(match.group(1)))
 
     if epoch_numbers:
         latest_epoch = max(epoch_numbers)
-        latest_model_path = os.path.join(model_dir, f'my_dpd_model_{latest_epoch}.keras') # Changed filename
+        latest_model_path = os.path.join(model_dir, f'my_dvae_model_{latest_epoch}.keras')
 
-        print(f"Latest saved DPD model found: {latest_model_path}. Loading model to resume training.") # Updated print
-        # custom_objects are not needed for this standard Keras DPD model
-        model = models.load_model(latest_model_path) # Removed custom_objects
-        model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), loss='mse') # Recompile after loading (with DPD specific settings)
-        print(f"Resuming training DPD model from total epochs: {latest_epoch}.") # Updated print
+        print(f"Latest saved model found: {latest_model_path}. Loading model to resume training.")
+        # Ensure DVAE and Sampling classes are available for custom_objects
+        dvae = models.load_model(latest_model_path, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
+        dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3)) # Recompile after loading
+        print(f"Resuming training from total epochs: {latest_epoch}.")
     else:
-        print("No parsable DPD models found in the directory. Starting new training.") # Updated print
+        print("No parsable DVAE models found in the directory. Starting new training.")
 else:
-    print("No saved DPD models found. Starting new training.") # Updated print
+    print("No saved DVAE models found. Starting new training.")
 
+# -------------------------
+# 5) Training
 # epoch_num defines how many epochs to run in each segment (e.g., [5, 5, ...])
 # epoch_num2 defines the *cumulative* epoch number for saving (e.g., [5, 10, ...])
 
@@ -187,42 +369,36 @@ if latest_epoch > 0:
         start_idx = 0
 
 for idx in range(start_idx, len(epoch_num)):
-    current_epochs_to_run = epoch_num[idx]
-    target_save_epoch_total = epoch_num2[idx]
+  current_epochs_to_run = epoch_num[idx]
+  target_save_epoch_total = epoch_num2[idx]
 
-    print(f"\n--- Training for {current_epochs_to_run} epochs (cumulative total: {target_save_epoch_total} epochs) ---")
-  
-    model.fit(
-        X_tr, Y_tr,
-        validation_data=(X_va, Y_va),
-        epochs=current_epochs_to_run,
-        batch_size=batch_size
-    )
-    
-    # --------------------------------------------------
-    # 6. Save model
-    # --------------------------------------------------
-    model_save_path_keras = os.path.join(model_dir, f'my_dpd_model_{target_save_epoch_total}.keras') # Changed filename
-    model.save(model_save_path_keras) # 확장자를 .keras로 변경
-    print(f'DPD 모델이 {model_save_path_keras}에 저장되었습니다.') # Updated print
-    print("evaluate shape: ", X_te.shape, Y_te.shape)
-    model.evaluate(X_te, Y_te)
+  print(f"\n--- Training for {current_epochs_to_run} epochs (cumulative total: {target_save_epoch_total} epochs) ---")
+  history = dvae.fit(
+    x=X_in_train_ch,
+    y=X_out_train_ch,
+    validation_data=(X_in_val_ch, X_out_val_ch),
+    epochs=current_epochs_to_run,
+    batch_size=batch_size
+  )
+
+  model_save_path_keras = os.path.join(model_dir, f'my_dvae_model_{target_save_epoch_total}.keras')
+  dvae.save(model_save_path_keras) # 확장자를 .keras로 변경
+  print(f'DVAE 모델이 {model_save_path_keras}에 저장되었습니다.')
+  print("evaluate shape: ", X_in_test_ch.shape, X_out_test_ch.shape)
+  dvae.evaluate(X_in_test_ch, X_out_test_ch)
+
+  # The original code loaded the just-saved model into `loaded_dvae_keras` but did not use it for subsequent training.
+  # Removing the redundant load as `dvae` is already the live, updated model.
+  # If a restart happens, the initial logic at the top of the cell will handle loading the latest model.
+
+# --- END MODIFIED PART ---
 
 # -------------------------
-# 7. Evaluation
+# 6) Evaluation on test set
 # -------------------------
+# predict restored inputs from HPA outputs
+pred_test = dvae.predict(X_in_test_ch, batch_size=batch_size)
 
-pred = model.predict(X_te)
-
-pred_c = to_complex(pred)
-ref_c = to_complex(Y_te)
-in_c = to_complex(X_te)
-
-nmse_pred = np.mean([complex_nmse_loss(pred_c[i],ref_c[i])
-                     for i in range(len(pred_c))])
-
-nmse_in = np.mean([complex_nmse_loss(in_c[i],ref_c[i])
-                   for i in range(len(in_c))])
-
-print("Baseline NMSE (HPA output vs target): {:.2f} dB".format(nmse_in))
-print("DPD NMSE: {:.2f} dB".format(nmse_pred))
+pred_test_c = to_complex(pred_test[0])
+hpa_test_c = to_complex(X_in_test_ch)
+ref_test_c = to_complex(X_out_test_ch)
