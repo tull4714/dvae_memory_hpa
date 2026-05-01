@@ -18,8 +18,25 @@ module_path = '/content/drive/MyDrive'
 if module_path not in sys.path:
     sys.path.append(module_path)
 
-from NonlinearMemory.dvae import Sampling
-from NonlinearMemory.dvae import DVAE
+# Explicitly add the NonlinearMemory directory to sys.path and import dvae directly
+# This resolves the ModuleNotFoundError encountered previously.
+nonlinear_memory_path = '/content/drive/MyDrive/NonlinearMemory'
+if nonlinear_memory_path not in sys.path:
+    sys.path.insert(0, nonlinear_memory_path)
+
+# Clear any cached references to 'dvae' or 'NonlinearMemory' before re-importing
+if 'dvae' in sys.modules:
+    del sys.modules['dvae']
+if 'NonlinearMemory' in sys.modules:
+    del sys.modules['NonlinearMemory']
+for module_name in list(sys.modules.keys()):
+    if module_name.startswith('NonlinearMemory.'):
+        del sys.modules[module_name]
+
+# Now import dvae directly as a module, and then extract Sampling and DVAE
+import dvae
+from dvae import Sampling
+from dvae import DVAE
 
 def polynomial(p_in, backoff):
     # Max row index is 5, max col index is 3. So, size 5x3 (or 6x3 for 0-indexing)
@@ -348,15 +365,15 @@ def build_decoder(seq_len, channels=2, latent_dim=64):
 
     return models.Model(latent_inputs,outputs,name="decoder")
 
-Fs = 4;          # frequency of the sample
-Fd = 1;          # frequency of the data
+Fs = 4          # frequency of the sample
+Fd = 1          # frequency of the data
 N = 64
 seq_len = N
-beta_kl = 1e-3  # KL weight (tune)
+beta_kl = 1e-3
+back_off = 5
 Block = 100000
 M = 4
 D = N * Block
-back_off = 5
 
 np.random.seed(seed=int(time.time()))
 
@@ -398,50 +415,32 @@ dvae_1ch = to_1ch(dvae_i_seq, dvae_q_seq)
 keras.backend.clear_session()
 name = '/content/drive/MyDrive/NonlinearMemory/my_dvae_model_100.weights.h5'
 
-# .keras 형식에서는 일반적으로 custom_objects를 명시적으로 지정할 필요가 없습니다.
-# Keras가 모델의 구조와 사용자 정의 클래스를 더 잘 이해합니다.
-# loaded_dvae_keras = models.load_model(name, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
-# print(f'DVAE 모델이 {name}에서 성공적으로 로드되었습니다.')
-
-# sig_in_Linear = loaded_dvae_keras.predict(dvae_1ch, batch_size=N)
-
-# 변경된 코드
+# 모델 구조 재생성 후 가중치 로드
 encoder = build_encoder(seq_len)
-
 decoder = build_decoder(seq_len)
-
-dvae = DVAE(encoder,decoder,beta=beta_kl)
-
-dvae.compile(
-    optimizer=tf.keras.optimizers.Adam(1e-3)
-)
-
-dvae.build((None,seq_len,2))
-
-dvae.summary()
-# 가중치 로드
+dvae = DVAE(encoder, decoder, beta=beta_kl, backoff=float(back_off))
+dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3))
+dvae.build((None, seq_len, 2))
 dvae.load_weights(name)
+print(f'DVAE 가중치를 {name}에서 성공적으로 로드했습니다.')
 
-# ❌ 기존 코드 (predict()가 tuple 전체를 반환할 수 있음)
-sig_in_Linear = dvae.predict(dvae_1ch, batch_size=N)
-sig_in_Linear_c = to_complex(sig_in_Linear)
-
-# ✅ 수정 코드 (outputs만 명시적으로 추출)
-all_outputs = []
+# DLA 추론: 원본 신호 → predistorted 신호
+# predict() 대신 직접 call() 사용 — outputs만 명시적으로 추출
+sig_in_Linear_list = []
 for i in range(0, len(dvae_1ch), N):
     batch = tf.constant(dvae_1ch[i:i+N])
-    outputs, _, _ = dvae(batch, training=False)   # outputs만 추출
-    all_outputs.append(outputs.numpy())
-sig_in_Linear = np.concatenate(all_outputs, axis=0)
+    predistorted, _, _ = dvae(batch, training=False)   # outputs만 추출
+    sig_in_Linear_list.append(predistorted.numpy())
+sig_in_Linear = np.concatenate(sig_in_Linear_list, axis=0)
+
 sig_in_Linear_c = to_complex(sig_in_Linear)
+sp_dvae_norm = sig_in_Linear_c.reshape(-1, 1)
 
-sp_dvae_norm = sig_in_Linear_c.reshape(-1, 1) # Reshape to column vector (N,1) for consistency with IQ_out_r.flatten() if it becomes (N,)
-
-# 역정규화
+# 역정규화 (원본 신호 RMS 기준)
 dvae_i_r, dvae_q_r = denormalize_with_rms(np.real(sp_dvae_norm).flatten(),
                                             np.imag(sp_dvae_norm).flatten(),
                                             rms_mag)
-dvae_r = (dvae_i_r + 1j * dvae_q_r).reshape(-1, 1) # Ensure dvae_r is also a column vector (N,1)
+dvae_r = (dvae_i_r + 1j * dvae_q_r).reshape(-1, 1)
 
 hpa_data_tx, _, _ = polynomial(IQ_out_r, back_off)
 hpa_dvae_r, _, _ = polynomial(dvae_r, back_off)     # DVAE
