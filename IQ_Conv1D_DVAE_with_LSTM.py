@@ -1,9 +1,17 @@
 import os
+import sys
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, models
-import re # Added for regular expressions
+import re
+
+# dvae.py에서 DVAE, Sampling, polynomial_tf import
+# (NonlinearMemory/dvae.py 경로에 위치)
+module_path = '/content/drive/MyDrive'
+if module_path not in sys.path:
+    sys.path.append(module_path)
+from NonlinearMemory.dvae import Sampling, DVAE, polynomial_tf
 
 # -----------------------------
 # RMS Normalization
@@ -33,19 +41,6 @@ def to_1ch(i, q):
 # convert to complex
 def to_complex(x2ch):
     return x2ch[...,0] + 1j * x2ch[...,1]
-
-# -----------------------------
-# Sampling Layer
-# -----------------------------
-class Sampling(layers.Layer):
-
-    def call(self, inputs):
-
-        z_mean, z_log_var = inputs
-
-        epsilon = tf.random.normal(shape=tf.shape(z_mean))
-
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 
 # -----------------------------
@@ -93,143 +88,12 @@ def build_decoder(seq_len, channels=2, latent_dim=64):
 
 
 # -----------------------------
-# DVAE DPD Model
-# -----------------------------
-class DVAE(tf.keras.Model):
-
-    def __init__(self, encoder, decoder, beta=0.0005, **kwargs):
-
-        super(DVAE,self).__init__(**kwargs)
-
-        self.encoder = encoder
-
-        self.decoder = decoder
-
-        self.sampling = Sampling()
-
-        self.beta = beta
-
-    # Add an explicit build method for custom subclassed models
-    def build(self, input_shape):
-        # Call the build methods of sub-models if they are not already built
-        if not self.encoder.built:
-            self.encoder.build(input_shape)
-        # The decoder's input shape is (batch_size, latent_dim)
-        # We need to get latent_dim from the encoder's output or pass it directly.
-        # Assuming latent_dim is accessible or set during DVAE init for decoder construction.
-        # A simpler way to ensure the decoder is built is to define its input_shape based on latent_dim.
-        # Since build_decoder takes latent_dim, we can ensure it's built there.
-        # For the DVAE itself, simply call super().build.
-        super().build(input_shape)
-	# Add get_config to serialize the model
-    def get_config(self):
-        config = super().get_config()
-        # Save the configurations of the sub-models
-        config.update({
-            "encoder_config": self.encoder.get_config(),
-            "decoder_config": self.decoder.get_config(),
-            "beta": self.beta,
-        })
-        return config
-
-    # Add from_config to deserialize the model
-    @classmethod
-    def from_config(cls, config, custom_objects=None):
-        beta = config.pop("beta", 1e-3)
-        encoder_config_dict = config.pop("encoder_config")
-        decoder_config_dict = config.pop("decoder_config")
-
-        # Make sure custom_objects are passed to sub-model deserialization
-        if custom_objects is None: # Corrected from `=== None`
-            custom_objects = {}
-        # Ensure Sampling layer is recognized during sub-model deserialization
-        custom_objects['Sampling'] = Sampling
-
-        # Reconstruct encoder and decoder using Model.from_config
-        reconstructed_encoder = tf.keras.models.Model.from_config(encoder_config_dict, custom_objects=custom_objects)
-        reconstructed_decoder = tf.keras.models.Model.from_config(decoder_config_dict, custom_objects=custom_objects)
-
-        # Instantiate the DVAE class with the reconstructed sub-models and beta
-        return cls(encoder=reconstructed_encoder, decoder=reconstructed_decoder, beta=beta, **config)
-
-    def call(self, inputs, training=False):
-
-        z_mean, z_log_var = self.encoder(inputs)
-
-        # sampling only during training
-        if training:
-            z = self.sampling([z_mean, z_log_var])
-        else:
-            z = z_mean
-
-        correction = self.decoder(z)
-
-        # residual predistortion
-        outputs = inputs + correction
-
-        return outputs, z_mean, z_log_var
-
-
-    def train_step(self,data):
-
-        x,y = data
-
-        with tf.GradientTape() as tape:
-
-            y_pred,z_mean,z_log_var = self(x,training=True)
-
-            recon_loss = tf.reduce_mean(
-                tf.square(y - y_pred)
-            )
-
-            kl_loss = -0.5 * tf.reduce_mean(
-                1 + z_log_var
-                - tf.square(z_mean)
-                - tf.exp(z_log_var)
-            )
-
-            loss = recon_loss + self.beta * kl_loss
-
-        grads = tape.gradient(loss,self.trainable_weights)
-
-        self.optimizer.apply_gradients(
-            zip(grads,self.trainable_weights)
-        )
-
-        return {
-            "loss":loss,
-            "recon_loss":recon_loss,
-            "kl_loss":kl_loss
-        }
-
-    def test_step(self, data):
-        # 1. 데이터 분리 (x: 입력, y: 타겟)
-        x, y = data
-
-        # 2. call() 메서드를 활용하여 일관성 유지
-        # 이렇게 하면 내부적으로 encoder -> sampling -> decoder 과정이 자동으로 수행됩니다.
-        y_pred, z_mean, z_log_var = self(x, training=False)
-
-        # 3. 손실 계산
-        recon_loss = tf.reduce_mean(tf.square(y - y_pred))
-        kl_loss = -0.5 * tf.reduce_mean(
-            1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)
-        )
-        loss = recon_loss + self.beta * kl_loss
-
-        # 4. 결과 반환 (loss_tracker가 없어도 Keras가 자동으로 처리하도록 딕셔너리 반환)
-        return {
-            "loss": loss,
-            "recon_loss": recon_loss,
-            "kl_loss": kl_loss
-        }
-
-# -----------------------------
 # Model Build
 # -----------------------------
 N = 64
 seq_len = N
 beta_kl = 1e-3  # KL weight (tune)
+back_off = 5    # HPA backoff (dB) — polynomial_tf와 동일하게 유지
 batch_size = N * 2 # 훈련 시 한 번에 처리되는 샘플의 수
 
 file1_I	 = '/content/drive/MyDrive/input_iq_I.csv'
@@ -300,20 +164,11 @@ outputData_val_Q = outputData_Q[n_train: n_train + n_val]
 outputData_test_I = outputData_I[n_train + n_val: ]
 outputData_test_Q = outputData_Q[n_train + n_val: ]
 
-# Capture the third return value (rms_magnitude)
-# train input의 RMS를 기준으로 삼음
-# _, _, rms_train = normalize_with_rms(inputData_I_train, inputData_Q_train)
-_, _, rms_train = normalize_with_rms(outputData_I_train, inputData_Q_train)
+# DLA: 원본 신호(outputData)를 기준으로 정규화
+# 훈련/추론 모두 원본 신호가 입력이므로 정규화 기준이 자동으로 일치
+_, _, rms_train = normalize_with_rms(outputData_train_I, outputData_train_Q)
 
-# input 정규화 (모두 동일 rms_train 적용)
-inputData_I_train = inputData_I_train / rms_train
-inputData_Q_train = inputData_Q_train / rms_train
-inputData_I_val   = inputData_I_val   / rms_train
-inputData_Q_val   = inputData_Q_val   / rms_train
-inputData_I_test  = inputData_I_test  / rms_train
-inputData_Q_test  = inputData_Q_test  / rms_train
-
-# target도 동일한 rms_train으로 정규화
+# 원본 신호 정규화
 target_I_train = outputData_train_I / rms_train
 target_Q_train = outputData_train_Q / rms_train
 target_I_val   = outputData_val_I   / rms_train
@@ -321,15 +176,17 @@ target_Q_val   = outputData_val_Q   / rms_train
 target_I_test  = outputData_test_I  / rms_train
 target_Q_test  = outputData_test_Q  / rms_train
 
-print(f"Shape of inputData_I_train after split and norm: {inputData_I_train.shape}")
+print(f"rms_train (원본 신호 기준): {rms_train:.6f}")
 print(f"Shape of target_I_train after split and norm: {target_I_train.shape}")
 
-X_in_train_ch = to_1ch(inputData_I_train, inputData_Q_train)
-X_out_train_ch = to_1ch(target_I_train, target_Q_train)
-X_in_val_ch = to_1ch(inputData_I_val, inputData_Q_val)
-X_out_val_ch = to_1ch(target_I_val, target_Q_val)
-X_in_test_ch = to_1ch(inputData_I_test, inputData_Q_test)
-X_out_test_ch = to_1ch(target_I_test, target_Q_test)
+# DLA: X_in = X_out = 원본 신호
+# loss는 train_step 내부에서 HPA 통과 후 계산 → 별도 target 불필요
+X_in_train_ch  = to_1ch(target_I_train, target_Q_train)
+X_out_train_ch = to_1ch(target_I_train, target_Q_train)   # X_in과 동일
+X_in_val_ch    = to_1ch(target_I_val,   target_Q_val)
+X_out_val_ch   = to_1ch(target_I_val,   target_Q_val)
+X_in_test_ch   = to_1ch(target_I_test,  target_Q_test)
+X_out_test_ch  = to_1ch(target_I_test,  target_Q_test)
 
 print("Shapes of final training data (X_out_train_ch, X_in_train_ch) *before* fit:")
 print(f"X_out_train_ch.shape: {X_out_train_ch.shape}, X_in_train_ch.shape: {X_in_train_ch.shape}")
@@ -338,7 +195,7 @@ encoder = build_encoder(seq_len)
 
 decoder = build_decoder(seq_len)
 
-dvae = DVAE(encoder,decoder,beta=beta_kl)
+dvae = DVAE(encoder, decoder, beta=beta_kl, backoff=float(back_off))
 
 dvae.compile(
     optimizer=tf.keras.optimizers.Adam(1e-3)
