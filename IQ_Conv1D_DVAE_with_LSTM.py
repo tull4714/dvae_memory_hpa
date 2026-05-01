@@ -1,6 +1,3 @@
-# IQ_Conv1D_DVAE_with_LSTM.py
-# Keras/TensorFlow implementation of Conv1D + LSTM DVAE for complex IQ signals
-
 import os
 import numpy as np
 import pandas as pd
@@ -8,21 +5,26 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 import re # Added for regular expressions
 
-# -------------------------
-# 1) Utilities
-# -------------------------
-
+# -----------------------------
+# RMS Normalization
+# -----------------------------
 def normalize_with_rms(I_data, Q_data):
+
     magnitude = np.sqrt(I_data**2 + Q_data**2)
+
     rms = np.sqrt(np.mean(magnitude**2))
+
     if rms > 0:
         return I_data/rms, Q_data/rms, rms
+
     return I_data, Q_data, 1.0
-    
-# ---------------------------------
-# Complex IQ -> 2 channel
-# ---------------------------------
+
+
+# -----------------------------
+# complex -> 2 channel
+# -----------------------------
 def to_2ch(x):
+
     return np.stack([np.real(x), np.imag(x)], axis=-1)
 
 def to_1ch(i, q):
@@ -32,9 +34,9 @@ def to_1ch(i, q):
 def to_complex(x2ch):
     return x2ch[...,0] + 1j * x2ch[...,1]
 
-# ---------------------------------
-# Sampling Layer (Reparameterization)
-# ---------------------------------
+# -----------------------------
+# Sampling Layer
+# -----------------------------
 class Sampling(layers.Layer):
 
     def call(self, inputs):
@@ -46,61 +48,80 @@ class Sampling(layers.Layer):
         return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 
-# ---------------------------------
+# -----------------------------
 # Encoder
-# ---------------------------------
+# -----------------------------
 def build_encoder(seq_len):
 
     inputs = layers.Input(shape=(seq_len,2))
 
     x = layers.Conv1D(64,5,padding="same",activation="relu")(inputs)
+
     x = layers.Conv1D(64,5,padding="same",activation="relu")(x)
+
+    x = layers.Conv1D(128,3,padding="same",activation="relu")(x)
 
     x = layers.Bidirectional(
         layers.LSTM(128, return_sequences=False)
     )(x)
 
     z_mean = layers.Dense(64)(x)
+
     z_log_var = layers.Dense(64)(x)
 
-    return models.Model(inputs,[z_mean,z_log_var])
+    return models.Model(inputs,[z_mean,z_log_var],name="encoder")
 
 
-# ---------------------------------
+# -----------------------------
 # Decoder
-# ---------------------------------
+# -----------------------------
 def build_decoder(seq_len, channels=2, latent_dim=64):
 
     latent_inputs = layers.Input(shape=(latent_dim,))
 
-    x = layers.Dense(seq_len*64,activation="relu")(latent_inputs)
+    x = layers.Dense(seq_len*128,activation="relu")(latent_inputs)
 
-    x = layers.Reshape((seq_len,64))(x)
+    x = layers.Reshape((seq_len,128))(x)
+
+    x = layers.Conv1D(128,5,padding="same",activation="relu")(x)
 
     x = layers.Conv1D(64,5,padding="same",activation="relu")(x)
-    x = layers.Conv1D(32,5,padding="same",activation="relu")(x)
 
     outputs = layers.Conv1D(channels,1,padding="same")(x)
 
     return models.Model(latent_inputs,outputs,name="decoder")
 
 
-# ---------------------------------
-# DVAE Model (DPD version)
-# ---------------------------------
+# -----------------------------
+# DVAE DPD Model
+# -----------------------------
 class DVAE(tf.keras.Model):
 
-    def __init__(self, encoder, decoder, beta=0.001, **kwargs):
+    def __init__(self, encoder, decoder, beta=0.0005, **kwargs):
 
         super(DVAE,self).__init__(**kwargs)
 
         self.encoder = encoder
+
         self.decoder = decoder
-        self.beta = beta
 
         self.sampling = Sampling()
 
-    # Add get_config to serialize the model
+        self.beta = beta
+
+    # Add an explicit build method for custom subclassed models
+    def build(self, input_shape):
+        # Call the build methods of sub-models if they are not already built
+        if not self.encoder.built:
+            self.encoder.build(input_shape)
+        # The decoder's input shape is (batch_size, latent_dim)
+        # We need to get latent_dim from the encoder's output or pass it directly.
+        # Assuming latent_dim is accessible or set during DVAE init for decoder construction.
+        # A simpler way to ensure the decoder is built is to define its input_shape based on latent_dim.
+        # Since build_decoder takes latent_dim, we can ensure it's built there.
+        # For the DVAE itself, simply call super().build.
+        super().build(input_shape)
+	# Add get_config to serialize the model
     def get_config(self):
         config = super().get_config()
         # Save the configurations of the sub-models
@@ -119,7 +140,7 @@ class DVAE(tf.keras.Model):
         decoder_config_dict = config.pop("decoder_config")
 
         # Make sure custom_objects are passed to sub-model deserialization
-        if custom_objects is None:
+        if custom_objects is None: # Corrected from `=== None`
             custom_objects = {}
         # Ensure Sampling layer is recognized during sub-model deserialization
         custom_objects['Sampling'] = Sampling
@@ -130,13 +151,14 @@ class DVAE(tf.keras.Model):
 
         # Instantiate the DVAE class with the reconstructed sub-models and beta
         return cls(encoder=reconstructed_encoder, decoder=reconstructed_decoder, beta=beta, **config)
-            
-    def call(self,inputs,training=False):
 
-        z_mean,z_log_var = self.encoder(inputs)
+    def call(self, inputs, training=False):
 
+        z_mean, z_log_var = self.encoder(inputs)
+
+        # sampling only during training
         if training:
-            z = self.sampling([z_mean,z_log_var])
+            z = self.sampling([z_mean, z_log_var])
         else:
             z = z_mean
 
@@ -145,7 +167,7 @@ class DVAE(tf.keras.Model):
         # residual predistortion
         outputs = inputs + correction
 
-        return outputs,z_mean,z_log_var
+        return outputs, z_mean, z_log_var
 
 
     def train_step(self,data):
@@ -183,7 +205,7 @@ class DVAE(tf.keras.Model):
     def test_step(self, data):
         # 1. 데이터 분리 (x: 입력, y: 타겟)
         x, y = data
-        
+
         # 2. call() 메서드를 활용하여 일관성 유지
         # 이렇게 하면 내부적으로 encoder -> sampling -> decoder 과정이 자동으로 수행됩니다.
         y_pred, z_mean, z_log_var = self(x, training=False)
@@ -202,9 +224,9 @@ class DVAE(tf.keras.Model):
             "kl_loss": kl_loss
         }
 
-# ---------------------------------
+# -----------------------------
 # Model Build
-# ---------------------------------
+# -----------------------------
 N = 64
 seq_len = N
 beta_kl = 1e-3  # KL weight (tune)
@@ -279,12 +301,25 @@ outputData_test_I = outputData_I[n_train + n_val: ]
 outputData_test_Q = outputData_Q[n_train + n_val: ]
 
 # Capture the third return value (rms_magnitude)
-inputData_I_train, inputData_Q_train, _ = normalize_with_rms(inputData_I_train, inputData_Q_train)
-inputData_I_val, inputData_Q_val, _ = normalize_with_rms(inputData_I_val, inputData_Q_val)
-inputData_I_test, inputData_Q_test, _ = normalize_with_rms(inputData_I_test, inputData_Q_test)
-target_I_train, target_Q_train, _ = normalize_with_rms(outputData_train_I, outputData_train_Q)
-target_I_val, target_Q_val, _ = normalize_with_rms(outputData_val_I, outputData_val_Q)
-target_I_test, target_Q_test, _ = normalize_with_rms(outputData_test_I, outputData_test_Q)
+# train input의 RMS를 기준으로 삼음
+# _, _, rms_train = normalize_with_rms(inputData_I_train, inputData_Q_train)
+_, _, rms_train = normalize_with_rms(outputData_I_train, inputData_Q_train)
+
+# input 정규화 (모두 동일 rms_train 적용)
+inputData_I_train = inputData_I_train / rms_train
+inputData_Q_train = inputData_Q_train / rms_train
+inputData_I_val   = inputData_I_val   / rms_train
+inputData_Q_val   = inputData_Q_val   / rms_train
+inputData_I_test  = inputData_I_test  / rms_train
+inputData_Q_test  = inputData_Q_test  / rms_train
+
+# target도 동일한 rms_train으로 정규화
+target_I_train = outputData_train_I / rms_train
+target_Q_train = outputData_train_Q / rms_train
+target_I_val   = outputData_val_I   / rms_train
+target_Q_val   = outputData_val_Q   / rms_train
+target_I_test  = outputData_test_I  / rms_train
+target_Q_test  = outputData_test_Q  / rms_train
 
 print(f"Shape of inputData_I_train after split and norm: {inputData_I_train.shape}")
 print(f"Shape of target_I_train after split and norm: {target_I_train.shape}")
@@ -300,6 +335,7 @@ print("Shapes of final training data (X_out_train_ch, X_in_train_ch) *before* fi
 print(f"X_out_train_ch.shape: {X_out_train_ch.shape}, X_in_train_ch.shape: {X_in_train_ch.shape}")
 
 encoder = build_encoder(seq_len)
+
 decoder = build_decoder(seq_len)
 
 dvae = DVAE(encoder,decoder,beta=beta_kl)
@@ -318,25 +354,26 @@ dvae.summary()
 # ---------------------------------
 # --- MODIFIED PART FOR RESUMING TRAINING ---
 model_dir = '/content/drive/MyDrive/NonlinearMemory/'
-saved_models = [f for f in os.listdir(model_dir) if f.startswith('my_dvae_model_') and f.endswith('.keras')]
+saved_models = [f for f in os.listdir(model_dir) if f.startswith('my_dvae_model_') and f.endswith('.weights.h5')]
 latest_epoch = 0
 latest_model_path = None
 
 if saved_models:
     epoch_numbers = []
     for model_file in saved_models:
-        match = re.search(r'my_dvae_model_(\d+)\.keras', model_file)
+        match = re.search(r'my_dvae_model_(\d+)\.weights.h5', model_file)
         if match:
             epoch_numbers.append(int(match.group(1)))
 
     if epoch_numbers:
         latest_epoch = max(epoch_numbers)
-        latest_model_path = os.path.join(model_dir, f'my_dvae_model_{latest_epoch}.keras')
+        latest_model_path = os.path.join(model_dir, f'my_dvae_model_{latest_epoch}.weights.h5')
 
         print(f"Latest saved model found: {latest_model_path}. Loading model to resume training.")
         # Ensure DVAE and Sampling classes are available for custom_objects
-        dvae = models.load_model(latest_model_path, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
-        dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3)) # Recompile after loading
+        # dvae = models.load_model(latest_model_path, custom_objects={'DVAE': DVAE, 'Sampling': Sampling})
+        # dvae.compile(optimizer=tf.keras.optimizers.Adam(1e-3)) # Recompile after loading
+        dvae.load_weights(latest_model_path)
         print(f"Resuming training from total epochs: {latest_epoch}.")
     else:
         print("No parsable DVAE models found in the directory. Starting new training.")
@@ -369,27 +406,36 @@ if latest_epoch > 0:
         start_idx = 0
 
 for idx in range(start_idx, len(epoch_num)):
-  current_epochs_to_run = epoch_num[idx]
-  target_save_epoch_total = epoch_num2[idx]
+    current_epochs_to_run = epoch_num[idx]
+    target_save_epoch_total = epoch_num2[idx]
 
-  print(f"\n--- Training for {current_epochs_to_run} epochs (cumulative total: {target_save_epoch_total} epochs) ---")
-  history = dvae.fit(
-    x=X_in_train_ch,
-    y=X_out_train_ch,
-    validation_data=(X_in_val_ch, X_out_val_ch),
-    epochs=current_epochs_to_run,
-    batch_size=batch_size
-  )
+    print(f"\n--- Training for {current_epochs_to_run} epochs (cumulative total: {target_save_epoch_total} epochs) ---")
+    history = dvae.fit(
+        x=X_in_train_ch,
+        y=X_out_train_ch,
+        validation_data=(X_in_val_ch, X_out_val_ch),
+        epochs=current_epochs_to_run,
+        batch_size=batch_size
+    )
 
-  model_save_path_keras = os.path.join(model_dir, f'my_dvae_model_{target_save_epoch_total}.keras')
-  dvae.save(model_save_path_keras) # 확장자를 .keras로 변경
-  print(f'DVAE 모델이 {model_save_path_keras}에 저장되었습니다.')
-  print("evaluate shape: ", X_in_test_ch.shape, X_out_test_ch.shape)
-  dvae.evaluate(X_in_test_ch, X_out_test_ch)
+    # -----------------------------
+    # Save model
+    # -----------------------------
+    # 기존 코드
+    # model_save_path_keras = os.path.join(model_dir, f'my_dvae_model_{target_save_epoch_total}.keras')
+    # dvae.save(model_save_path_keras)
 
-  # The original code loaded the just-saved model into `loaded_dvae_keras` but did not use it for subsequent training.
-  # Removing the redundant load as `dvae` is already the live, updated model.
-  # If a restart happens, the initial logic at the top of the cell will handle loading the latest model.
+    # 변경된 코드
+    model_save_path_weights = os.path.join(model_dir, f'my_dvae_model_{target_save_epoch_total}.weights.h5')
+    dvae.save_weights(model_save_path_weights)
+    print(f'DVAE 가중치가 {model_save_path_weights}에 저장되었습니다.')
+
+    print("evaluate shape: ", X_in_test_ch.shape, X_out_test_ch.shape)
+    dvae.evaluate(X_in_test_ch, X_out_test_ch)
+
+    # The original code loaded the just-saved model into `loaded_dvae_keras` but did not use it for subsequent training.
+    # Removing the redundant load as `dvae` is already the live, updated model.
+    # If a restart happens, the initial logic at the top of the cell will handle loading the latest model.
 
 # --- END MODIFIED PART ---
 
@@ -398,7 +444,3 @@ for idx in range(start_idx, len(epoch_num)):
 # -------------------------
 # predict restored inputs from HPA outputs
 pred_test = dvae.predict(X_in_test_ch, batch_size=batch_size)
-
-pred_test_c = to_complex(pred_test[0])
-hpa_test_c = to_complex(X_in_test_ch)
-ref_test_c = to_complex(X_out_test_ch)
