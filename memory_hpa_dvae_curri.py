@@ -142,6 +142,10 @@ def denormalize_with_rms(I_data, Q_data, rms_magnitude):
 def decision(D, M, signal_in, signal_out):
     """
     수신된 신호를 복조하고 심볼 오류율(Pse) 및 비트 오류율(Pbe)을 계산합니다.
+
+    16QAM은 gen_mapping에서 sqrt(10)으로 정규화되어 심볼 레벨이
+    ±3/√10, ±1/√10 이므로, 경판정 전에 sqrt(10)을 곱해 원래 레벨
+    (±3, ±1)로 복원한 뒤 임계값 ±2로 판정한다.
     """
 
     numoferror = 0
@@ -152,10 +156,13 @@ def decision(D, M, signal_in, signal_out):
     else:
         log2M = 1
 
+    # 16QAM 정규화 해제 스케일
+    qam_scale = np.sqrt(10.0) if M == 16 else 1.0
+
     for k in range(D):
 
-        r_out = np.real(signal_out[k])
-        i_out = np.imag(signal_out[k])
+        r_out = np.real(signal_out[k]) * qam_scale
+        i_out = np.imag(signal_out[k]) * qam_scale
 
         # --- 1. 실수부 (I) 결정 ---
         decis_real = 0
@@ -200,13 +207,16 @@ def decision(D, M, signal_in, signal_out):
         # --- 3. 최종 결정된 심볼 ---
         decis = decis_real + decis_imag
 
+        # 송신 심볼도 동일 스케일로 복원
+        sig_in_k = signal_in[k] * qam_scale
+
         # --- 4. 심볼 오류 계산 (Pse) ---
-        if decis != signal_in[k]:
+        if decis != sig_in_k:
             numoferror += 1
 
         # --- 5. 비트 오류 계산 (Pbe) ---
-        r_in = np.real(signal_in[k])
-        i_in = np.imag(signal_in[k])
+        r_in = np.real(sig_in_k)
+        i_in = np.imag(sig_in_k)
 
         # A. 실수부 (I) 오류 계산:
 
@@ -249,7 +259,9 @@ def gen_mapping(M, D):
     elif M == 4:
         s = (2 * np.fix(rand_I * 2) - 1) + 1j * (2 * np.fix(rand_Q * 2) - 1)
     elif M == 16:
+        # 16QAM: I, Q ∈ {-3,-1,+1,+3}, sqrt(10) 단위전력 정규화 (데이터 생성과 동일)
         s = (-2 * np.fix(rand_I * 4) + 3) + 1j * (-2 * np.fix(rand_Q * 4) + 3)
+        s = s / np.sqrt(10.0)
 
     return s
 
@@ -315,6 +327,31 @@ def hard_decision(in_vector, M):
 
     return out_vector
 
+def _qam16_axis_bits(level):
+    """
+    16QAM 한 축(정규화 전 레벨 -3,-1,+1,+3)의 2비트 그레이 코드 반환.
+    -3 → (0,0), -1 → (0,1), +1 → (1,1), +3 → (1,0)
+    """
+    if level < -2:      # -3
+        return (0, 0)
+    elif level < 0:     # -1
+        return (0, 1)
+    elif level < 2:     # +1
+        return (1, 1)
+    else:               # +3
+        return (1, 0)
+
+def _qam16_axis_decide(val):
+    """수신값(정규화 전 스케일)을 가장 가까운 16QAM 레벨로 경판정."""
+    if val < -2:
+        return -3
+    elif val < 0:
+        return -1
+    elif val < 2:
+        return 1
+    else:
+        return 3
+
 def ber_call_qpsk(a, b, M):
     numoferr = 0
     NumOfBitError = 0
@@ -351,6 +388,37 @@ def ber_call_qpsk(a, b, M):
         ps = NumOfSymbolError / D
         ber = pb
 
+    elif M == 16:
+        # 16QAM: 심볼당 4비트 (I축 2비트 + Q축 2비트, 그레이 코딩)
+        # A(수신), B(송신) 모두 sqrt(10)으로 정규화되어 있으므로 복원
+        scale = np.sqrt(10.0)
+        for q in range(D):
+            # 정규화 해제 → 원래 레벨 스케일(-3,-1,+1,+3)
+            rx_I = np.real(A[q]) * scale
+            rx_Q = np.imag(A[q]) * scale
+            tx_I = np.real(B[q]) * scale
+            tx_Q = np.imag(B[q]) * scale
+
+            # 송신 비트 (정확한 레벨에서)
+            tx_I_lvl = _qam16_axis_decide(tx_I)
+            tx_Q_lvl = _qam16_axis_decide(tx_Q)
+            tx_bits = _qam16_axis_bits(tx_I_lvl) + _qam16_axis_bits(tx_Q_lvl)
+
+            # 수신 비트 (경판정 후)
+            rx_I_lvl = _qam16_axis_decide(rx_I)
+            rx_Q_lvl = _qam16_axis_decide(rx_Q)
+            rx_bits = _qam16_axis_bits(rx_I_lvl) + _qam16_axis_bits(rx_Q_lvl)
+
+            # 4비트 비교
+            bit_err = sum(1 for tb, rb in zip(tx_bits, rx_bits) if tb != rb)
+            NumOfBitError += bit_err
+            if bit_err > 0:
+                NumOfSymbolError += 1
+
+        pb = NumOfBitError / (4 * D)   # 심볼당 4비트
+        ps = NumOfSymbolError / D
+        ber = pb
+
     return ber
 
 # -----------------------------
@@ -383,9 +451,9 @@ Fd = 1          # frequency of the data
 N = 64
 seq_len = N
 beta_kl = 1e-3
-back_off = 2    # ★ 데이터 생성/훈련과 동일하게 2로 설정
+back_off = 1    # ★ 데이터 생성/훈련과 동일하게 1로 설정 (16QAM)
 Block = 100000
-M = 4
+M = 16          # ★ 16QAM (이전: QPSK M=4)
 D = N * Block
 hpa_snr = 20
 
