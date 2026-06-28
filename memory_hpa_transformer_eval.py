@@ -784,18 +784,53 @@ print("="*55 + "\n")
 
 sigpwr = np.linalg.norm(IQ_out_r) ** 2 / len(IQ_out_r)
 
+# =======================================================================
+# AWGN-only EVM vs SNR (페이딩 없음 — 순수 DPD + AWGN 성능)
+# 페이딩(h) 미적용 → 노이즈 증폭(n/h) 없는 순수 AWGN. 채널 무관, 1회 계산.
+# =======================================================================
+def _ofdm_demod_freq(time_sig):
+    rx = (Fd / Fs) / N * time_sig
+    sp = rx.reshape(int(Fs / Fd * N), -1)
+    fout = np.fft.fft(sp, axis=0)
+    s1 = int(Fs / Fd * N - N / 2)
+    s2 = int(Fs / Fd * N)
+    yy = np.concatenate((fout[: N//2, :], fout[s1:s2, :]))
+    return yy.reshape(1, -1).flatten()
+
+awgn_hpa_evm  = np.zeros(len(SNR))
+awgn_dvae_evm = np.zeros(len(SNR))
+_tx_sym = b.flatten()
+_ref_pow = np.mean(np.abs(_tx_sym) ** 2)
+
+np.random.seed(12345)
+for m in range(len(SNR)):
+    snr_wp = 10 ** (SNR[m] / 10)
+    sgma = np.sqrt(sigpwr * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+    n = sgma * np.random.randn(*IQ_out_r.shape) + 1j * sgma * np.random.randn(*IQ_out_r.shape)
+    rx_hpa_sym  = _ofdm_demod_freq(hpa_data_tx + n)
+    rx_dvae_sym = _ofdm_demod_freq(hpa_dvae_r  + n)
+    awgn_hpa_evm[m]  = np.sqrt(np.mean(np.abs(rx_hpa_sym  - _tx_sym)**2) / _ref_pow) * 100.0
+    awgn_dvae_evm[m] = np.sqrt(np.mean(np.abs(rx_dvae_sym - _tx_sym)**2) / _ref_pow) * 100.0
+
+print("\n" + "="*55)
+print("AWGN-only EVM vs SNR (페이딩 없음, 순수 DPD+AWGN)")
+print("="*55)
+print(f"SNR(dB):           {np.array2string(SNR, precision=0)}")
+print(f"HPA  EVM(%):       {np.array2string(awgn_hpa_evm,  precision=3, separator=', ')}")
+print(f"Transformer EVM(%): {np.array2string(awgn_dvae_evm, precision=3, separator=', ')}")
+print("="*55 + "\n")
+
 # Define channel k-factor values: 0 for Rayleigh, 4 for Rician
 channel_k_values = {0: 'Rayleigh', 4: 'Rician'}
 simulated_bers = {} # Dictionary to store BERs for each K-factor
 hpa_bers = {}
-
-# --- DVAE BER 결과를 저장할 변수 초기화 ---
 dvae_bers = {}
 
 for k_factor, channel_name in channel_k_values.items():
     current_errb_array = np.zeros(len(SNR)) # Temporary array for current channel's BER
     hpa_errb_array = np.zeros(len(SNR)) # Temporary array for current channel's BER
     dvae_errb_array = np.zeros(len(SNR)) # DVAE BER 배열 초기화
+
     print(f"Simulating for K-factor = {k_factor} ({channel_name} Fading) with Perfect CSI")
 
     for m in range(len(SNR)):
