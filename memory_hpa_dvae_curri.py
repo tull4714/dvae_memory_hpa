@@ -22,7 +22,7 @@ module_path = '/content/drive/MyDrive'
 if module_path not in sys.path:
     sys.path.append(module_path)
 
-_dvae_path = '/content/drive/MyDrive/NonlinearMemory/dvae_curriculum.py'
+_dvae_path = '/content/drive/MyDrive/NonlinearMemory/dvae_curriculum/dvae_curriculum.py'
 
 # __pycache__ 삭제 (오염된 캐시 제거)
 _pycache = '/content/drive/MyDrive/NonlinearMemory/__pycache__'
@@ -739,6 +739,8 @@ else:
 print("="*55 + "\n")
 
 sigpwr = np.linalg.norm(IQ_out_r) ** 2 / len(IQ_out_r)
+sigpwr_hpa = np.linalg.norm(hpa_data_tx) ** 2 / len(hpa_data_tx)
+sigpwr_vtae = np.linalg.norm(hpa_dvae_r) ** 2 / len(hpa_dvae_r)
 
 # =======================================================================
 # AWGN-only EVM vs SNR (페이딩 없음 — 순수 DPD + AWGN 성능)
@@ -759,6 +761,7 @@ def _ofdm_demod_freq(time_sig):
     yy = np.concatenate((fout[: N//2, :], fout[s1:s2, :]))
     return yy.reshape(1, -1).flatten()
 
+awgn_ideal_evm = np.zeros(len(SNR))
 awgn_hpa_evm  = np.zeros(len(SNR))
 awgn_dvae_evm = np.zeros(len(SNR))
 _tx_sym = b.flatten()
@@ -772,9 +775,11 @@ for m in range(len(SNR)):
     n = sgma * np.random.randn(*IQ_out_r.shape) + 1j * sgma * np.random.randn(*IQ_out_r.shape)
 
     # 페이딩 없이 노이즈만 (h 곱/나눗셈 없음)
+    rx_ideal_sym = _ofdm_demod_freq(IQ_out_r + n)
     rx_hpa_sym  = _ofdm_demod_freq(hpa_data_tx + n)
     rx_dvae_sym = _ofdm_demod_freq(hpa_dvae_r  + n)
 
+    awgn_ideal_evm[m] = np.sqrt(np.mean(np.abs(rx_ideal_sym - _tx_sym) ** 2) / _ref_pow) * 100.0
     awgn_hpa_evm[m]  = np.sqrt(np.mean(np.abs(rx_hpa_sym  - _tx_sym)**2) / _ref_pow) * 100.0
     awgn_dvae_evm[m] = np.sqrt(np.mean(np.abs(rx_dvae_sym - _tx_sym)**2) / _ref_pow) * 100.0
 
@@ -782,10 +787,16 @@ print("\n" + "="*55)
 print("AWGN-only EVM vs SNR (페이딩 없음, 순수 DPD+AWGN)")
 print("="*55)
 print(f"SNR(dB):     {np.array2string(SNR, precision=0)}")
+print(f"Ideal EVM(%): {np.array2string(awgn_ideal_evm, precision=3, separator=', ')}")
 print(f"HPA  EVM(%): {np.array2string(awgn_hpa_evm,  precision=3, separator=', ')}")
 print(f"DVAE EVM(%): {np.array2string(awgn_dvae_evm, precision=3, separator=', ')}")
 print("="*55 + "\n")
 
+evm0 = lambda rx: np.sqrt(np.mean(np.abs(rx - _tx_sym)**2) / _ref_pow) * 100.0
+print(f"In-band noise-free EVM: Ideal {evm0(_ofdm_demod_freq(IQ_out_r)):.2e} %, "
+      f"HPA {evm0(_ofdm_demod_freq(hpa_data_tx)):.4f} %, "
+      f"DPD {evm0(_ofdm_demod_freq(hpa_dvae_r)):.4f} %")
+      
 # Define channel k-factor values: 0 for Rayleigh, 4 for Rician
 channel_k_values = {0: 'Rayleigh', 4: 'Rician'}
 simulated_bers = {} # Dictionary to store BERs for each K-factor
@@ -804,12 +815,22 @@ for k_factor, channel_name in channel_k_values.items():
     for m in range(len(SNR)):
         snr_wp = 10 ** (SNR[m] / 10)
         sgma = np.sqrt(sigpwr * (Fs/Fd) / snr_wp / 2 / np.log2(M))
-
+        sgma_hpa = np.sqrt(sigpwr_hpa * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+        sgma_vtae = np.sqrt(sigpwr_vtae * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+        
         # Generate complex noise
-        n_real = sgma * np.random.randn(*IQ_out_r.shape)
-        n_imag = sgma * np.random.randn(*IQ_out_r.shape)
+        gauss_real = np.random.randn(*IQ_out_r.shape)
+        gauss_imag  = np.random.randn(*IQ_out_r.shape)
+        n_real = sgma * gauss_real
+        n_imag = sgma * gauss_imag
+        n_real_hpa = sgma_hpa * gauss_real
+        n_imag_hpa = sgma_hpa * gauss_imag
+        n_real_vtae = sgma_vtae * gauss_real
+        n_imag_vtae = sgma_vtae * gauss_imag
         n = n_real + 1j * n_imag
-
+        n_hpa = n_real_hpa + 1j * n_imag_hpa
+        n_vtae = n_real_vtae + 1j * n_imag_vtae
+        
         # Fading (Using current_k_factor)
         frame = IQ_out_r.size
         if k_factor == 0: # Rayleigh fading (no line-of-sight component)
@@ -819,8 +840,8 @@ for k_factor, channel_name in channel_k_values.items():
 
         # Apply fading and noise
         receive_data = h * IQ_out_r + n
-        hpa_data_rx = h * hpa_data_tx + n
-        hpa_data_rx_dvae = h * hpa_dvae_r + n # DVAE
+        hpa_data_rx = h * hpa_data_tx + n_hpa
+        hpa_data_rx_dvae = h * hpa_dvae_r + n_vtae # DVAE
 
         # !!! Crucial Change: Perfect Channel State Information (P-CSI) Equalization
         # Divide by h to compensate for fading, assuming perfect channel knowledge.
