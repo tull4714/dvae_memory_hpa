@@ -22,7 +22,7 @@ module_path = '/content/drive/MyDrive'
 if module_path not in sys.path:
     sys.path.append(module_path)
 
-_dvae_path = '/content/drive/MyDrive/NonlinearMemory/dvae_curriculum.py'
+_dvae_path = '/content/drive/MyDrive/NonlinearMemory/dvae_curriculum/dvae_curriculum.py'
 
 # __pycache__ 삭제 (오염된 캐시 제거)
 _pycache = '/content/drive/MyDrive/NonlinearMemory/__pycache__'
@@ -783,6 +783,8 @@ else:
 print("="*55 + "\n")
 
 sigpwr = np.linalg.norm(IQ_out_r) ** 2 / len(IQ_out_r)
+sigpwr_hpa = np.linalg.norm(hpa_data_tx) ** 2 / len(hpa_data_tx)
+sigpwr_trans = np.linalg.norm(hpa_dvae_r) ** 2 / len(hpa_dvae_r)
 
 # =======================================================================
 # AWGN-only EVM vs SNR (페이딩 없음 — 순수 DPD + AWGN 성능)
@@ -806,9 +808,15 @@ np.random.seed(12345)
 for m in range(len(SNR)):
     snr_wp = 10 ** (SNR[m] / 10)
     sgma = np.sqrt(sigpwr * (Fs/Fd) / snr_wp / 2 / np.log2(M))
-    n = sgma * np.random.randn(*IQ_out_r.shape) + 1j * sgma * np.random.randn(*IQ_out_r.shape)
-    rx_hpa_sym  = _ofdm_demod_freq(hpa_data_tx + n)
-    rx_dvae_sym = _ofdm_demod_freq(hpa_dvae_r  + n)
+    sgma_hpa = np.sqrt(sigpwr_hpa * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+    sgma_trans = np.sqrt(sigpwr_trans * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+    # n = sgma * np.random.randn(*IQ_out_r.shape) + 1j * sgma * np.random.randn(*IQ_out_r.shape)
+    n_real = np.random.randn(*IQ_out_r.shape)
+    n_imag = np.random.randn(*IQ_out_r.shape)
+    n_hpa = sgma_hpa * n_real + 1j * sgma_hpa * n_imag
+    n_trans = sgma_trans * n_real + 1j * sgma_trans * n_imag
+    rx_hpa_sym  = _ofdm_demod_freq(hpa_data_tx + n_hpa)
+    rx_dvae_sym = _ofdm_demod_freq(hpa_dvae_r  + n_trans)
     awgn_hpa_evm[m]  = np.sqrt(np.mean(np.abs(rx_hpa_sym  - _tx_sym)**2) / _ref_pow) * 100.0
     awgn_dvae_evm[m] = np.sqrt(np.mean(np.abs(rx_dvae_sym - _tx_sym)**2) / _ref_pow) * 100.0
 
@@ -836,12 +844,19 @@ for k_factor, channel_name in channel_k_values.items():
     for m in range(len(SNR)):
         snr_wp = 10 ** (SNR[m] / 10)
         sgma = np.sqrt(sigpwr * (Fs/Fd) / snr_wp / 2 / np.log2(M))
-
+        sgma_hpa = np.sqrt(sigpwr_hpa * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+        sgma_trans = np.sqrt(sigpwr_trans * (Fs/Fd) / snr_wp / 2 / np.log2(M))
+    
         # Generate complex noise
-        n_real = sgma * np.random.randn(*IQ_out_r.shape)
-        n_imag = sgma * np.random.randn(*IQ_out_r.shape)
-        n = n_real + 1j * n_imag
-
+        #n_real = sgma * np.random.randn(*IQ_out_r.shape)
+        #n_imag = sgma * np.random.randn(*IQ_out_r.shape)
+        n_real = np.random.randn(*IQ_out_r.shape)
+        n_imag = np.random.randn(*IQ_out_r.shape)
+    
+        n = sgma * n_real + 1j * sgma * n_imag
+        n_hpa = sgma_hpa * n_real + 1j * sgma_hpa * n_imag
+        n_trans = sgma_trans * n_real + 1j * sgma_trans * n_imag
+        
         # Fading (Using current_k_factor)
         frame = IQ_out_r.size
         if k_factor == 0: # Rayleigh fading (no line-of-sight component)
@@ -851,8 +866,8 @@ for k_factor, channel_name in channel_k_values.items():
 
         # Apply fading and noise
         receive_data = h * IQ_out_r + n
-        hpa_data_rx = h * hpa_data_tx + n
-        hpa_data_rx_dvae = h * hpa_dvae_r + n # DVAE
+        hpa_data_rx = h * hpa_data_tx + n_hpa
+        hpa_data_rx_dvae = h * hpa_dvae_r + n_trans # Transformer
 
         # !!! Crucial Change: Perfect Channel State Information (P-CSI) Equalization
         # Divide by h to compensate for fading, assuming perfect channel knowledge.
