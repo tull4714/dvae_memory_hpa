@@ -1,84 +1,94 @@
+"""
+Transformer DPD 학습 (DLA + 커리큘럼) — VT-AE 학습 파일과 같은 절차, 모델만 Transformer
+
+[이번 변경] 실험 환경 통합 + 커리큘럼 버그 수정
+   1) 실험 설정은 모두 dvae_curriculum.py에서 읽는다:
+      PA_ORDER(5/7/9), PA_IBO_DB, 목표 이득 G_FIX, EXP_BATCH_SIZE, EXP_DATA_FRACTION,
+      EXP_USE_CURRICULUM, 단계 구성(EXP_STAGES_*), EXP_SAVE_INTERVAL.
+      VT-AE와 Transformer 학습 파일이 같은 값을 쓰므로 조건이 자동으로 같아진다.
+   2) 체크포인트 이름에 설정이 들어간다 (예: vtae_pa9_ibo8_b512_f0.02_cur_stage2_epoch20.weights.h5).
+   3) [버그 수정] 커리큘럼 단계를 바꿀 때 컴파일된 train/test 함수를 버려 새 memory depth로
+      다시 컴파일한다. 이전 코드는 2·3단계도 실제로는 Q = 0 PA로 학습되었다.
+   4) EXP_DATA_FRACTION < 1이면 학습 데이터의 앞부분 일부만 사용한다 (학습 예산 제한 실험).
+
+[변경 사항]
+1) HPA 모델: dvae_curriculum.py의 표준 memory polynomial, 고정 기준 전력(ref_power = 1.0)
+   학습 데이터는 원신호 RMS로 정규화되어 평균 전력이 정확히 1이므로 PA 기준 전력도 1.0으로 고정.
+2) 단계마다 fit을 한 번만 호출 (initial_epoch 사용).
+   이전에는 5 epoch씩 나눠 fit을 반복 호출해서 ReduceLROnPlateau/EarlyStopping의 상태가
+   호출마다 초기화되었고, 논문에 쓴 "5 epoch 정체 시 학습률 절반, 10 epoch 정체 시 조기 종료"가
+   실제로는 그렇게 동작하지 않았음. 체크포인트는 PeriodicSaver 콜백이 5 epoch마다 저장.
+3) 학습 곡선 기록: 매 epoch 검증 데이터로 전체 모델(Q = 2) 기준 EVM을 계산해 CSV로 저장
+   (단계가 달라도 같은 잣대로 비교 가능 → 커리큘럼 유무 비교 그림용).
+4) USE_CURRICULUM = False 로 두면 처음부터 Q = 2로 학습 (커리큘럼 비교 실험용).
+"""
 import os
 import sys
 import re
+import csv
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, models
-
-# ============================================================
-# dvae_curriculum.py에서 polynomial_tf, PhysicsBasisLayer 로드
-# (HPA 시뮬레이션 + 물리 기저)
-# ============================================================
 import importlib.util, shutil
 
-module_path = '/content/drive/MyDrive'
-if module_path not in sys.path:
-    sys.path.append(module_path)
+# ============================================================
+# 경로 설정
+# ============================================================
+BASE_DIR  = '/content/drive/MyDrive'
+MODEL_DIR = os.path.join(BASE_DIR, 'NonlinearMemory')
 
-_dvae_path = '/content/drive/MyDrive/NonlinearMemory/dvae_curriculum.py'
-_pycache = '/content/drive/MyDrive/NonlinearMemory/__pycache__'
+# dvae_curriculum.py를 파일 경로로 직접 로드 (패키지/캐시 문제 회피)
+_dvae_path = os.path.join(MODEL_DIR, 'dvae_curriculum.py')
+_pycache   = os.path.join(MODEL_DIR, '__pycache__')
 if os.path.exists(_pycache):
     shutil.rmtree(_pycache)
 for _key in list(sys.modules.keys()):
     if 'dvae_curriculum' in _key:
         del sys.modules[_key]
-
 _spec = importlib.util.spec_from_file_location("dvae_curriculum", _dvae_path)
 _mod  = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-polynomial_tf     = _mod.polynomial_tf
-PhysicsBasisLayer = _mod.PhysicsBasisLayer
-print("polynomial_tf, PhysicsBasisLayer 로드 성공")
+DVAE_Curriculum     = _mod.DVAE_Curriculum
+CurriculumScheduler = _mod.CurriculumScheduler
+PhysicsBasisLayer   = _mod.PhysicsBasisLayer
+polynomial_tf       = _mod.polynomial_tf
+PA_IBO_DB           = _mod.PA_IBO_DB
+dla_loss            = _mod.dla_loss
+print(f"실험 설정: {_mod.exp_tag()}, A_SAT {_mod.A_SAT:.3f}, 목표 이득 G {_mod.G_FIX}")
+print("dvae_curriculum 직접 로드 성공")
 
 
 # ============================================================
 # 유틸
 # ============================================================
 def normalize_with_rms(I_data, Q_data):
-    magnitude = np.sqrt(I_data**2 + Q_data**2)
-    rms = np.sqrt(np.mean(magnitude**2))
-    if rms > 0:
-        return I_data/rms, Q_data/rms, rms
-    return I_data, Q_data, 1.0
+    rms = np.sqrt(np.mean(I_data**2 + Q_data**2))
+    return (I_data / rms, Q_data / rms, rms) if rms > 0 else (I_data, Q_data, 1.0)
 
 def to_1ch(i, q):
     return np.stack([i, q], axis=-1).astype(np.float32)
 
 
 # ============================================================
-# Transformer DPD 구성 요소
+# Transformer DPD 구조 (Volterra 기저 + Transformer + residual)
 # ============================================================
 @tf.keras.utils.register_keras_serializable()
 class PositionalEncoding(layers.Layer):
     def __init__(self, sequence_length, d_model, **kwargs):
         super().__init__(**kwargs)
-        self.sequence_length = sequence_length
-        self.d_model = d_model
-        self.pos_encoding = self._positional_encoding(sequence_length, d_model)
-
-    def _get_angles(self, position, i, d_model):
-        return position * (1 / tf.pow(10000.0,
-                          (2 * (i // 2)) / tf.cast(d_model, tf.float32)))
-
-    def _positional_encoding(self, position, d_model):
-        angle_rads = self._get_angles(
-            tf.range(position, dtype=tf.float32)[:, tf.newaxis],
-            tf.range(d_model, dtype=tf.float32)[tf.newaxis, :], d_model)
-        sines   = tf.math.sin(angle_rads[:, 0::2])
-        cosines = tf.math.cos(angle_rads[:, 1::2])
-        pe = tf.concat([sines, cosines], axis=-1)
-        return tf.cast(pe[tf.newaxis, ...], tf.float32)
-
+        self.sequence_length, self.d_model = sequence_length, d_model
+        pos = tf.range(sequence_length, dtype=tf.float32)[:, tf.newaxis]
+        idx = tf.range(d_model, dtype=tf.float32)[tf.newaxis, :]
+        ang = pos * (1 / tf.pow(10000.0, (2 * (idx // 2)) / tf.cast(d_model, tf.float32)))
+        self.pos_encoding = tf.concat([tf.math.sin(ang[:, 0::2]), tf.math.cos(ang[:, 1::2])], -1)[tf.newaxis, ...]
     def call(self, inputs):
         return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
-
     def get_config(self):
         c = super().get_config()
         c.update({"sequence_length": self.sequence_length, "d_model": self.d_model})
         return c
-
 
 def transformer_encoder(inputs, d_model, num_heads, ff_dim, dropout=0.1):
     attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(inputs, inputs)
@@ -89,87 +99,54 @@ def transformer_encoder(inputs, d_model, num_heads, ff_dim, dropout=0.1):
     ffn  = layers.Dropout(dropout)(ffn)
     return layers.LayerNormalization(epsilon=1e-6)(out1 + ffn)
 
-
-def build_transformer_dpd(seq_len, d_model, num_heads, ff_dim, num_layers,
+def build_transformer_dpd(seq_len, d_model=64, num_heads=4, ff_dim=128, num_layers=2,
                           k_orders=(2, 4), q_depth=3):
-    """
-    물리기저 + Transformer + residual 구조의 DPD 모델.
-
-    구조:
-      원본 IQ → PhysicsBasisLayer (메모리 다항식 기저)
-              → Dense(d_model) → PositionalEncoding
-              → Transformer 블록 × num_layers
-              → Dense(2) = correction
-      predistorted = 원본 + correction   (residual)
-
-    residual 구조가 핵심: 모델은 작은 correction만 학습하면 되고,
-    DLA loss = MSE(원본 - HPA(predistorted))로 추론 목표와 일치시킴.
-    """
     inputs = layers.Input(shape=(seq_len, 2))
-
-    # 물리 기저: (b, seq_len, 2) → (b, seq_len, 2+2KQ)
-    basis = PhysicsBasisLayer(k_orders=k_orders, q_depth=q_depth)(inputs)
-
-    x = layers.Dense(d_model)(basis)
+    x = layers.Dense(d_model)(PhysicsBasisLayer(k_orders=k_orders, q_depth=q_depth)(inputs))
     x = PositionalEncoding(seq_len, d_model)(x)
     for _ in range(num_layers):
         x = transformer_encoder(x, d_model, num_heads, ff_dim)
-
     correction = layers.Dense(2, activation="linear")(x)
-    predistorted = layers.Add()([inputs, correction])   # residual
+    return models.Model(inputs, layers.Add()([inputs, correction]), name="Transformer_DPD_DLA")
 
-    return models.Model(inputs, predistorted, name="Transformer_DPD_DLA")
-
-
-# ============================================================
-# DLA 래퍼 모델 (train_step에서 HPA 통과)
-# ============================================================
-@tf.keras.utils.register_keras_serializable()
 class TransformerDPD_DLA(models.Model):
-    def __init__(self, core, backoff=1.0, memory_depth=0, snr_db=-1.0, **kwargs):
+    """DLA 래퍼: loss = dla_loss(x, HPA(core(x))), VT-AE의 DVAE_Curriculum과 같은 방식"""
+    def __init__(self, core, backoff=1.0, memory_depth=0, snr_db=-1.0, ref_power=1.0,
+                 loss_mode='fixed', g_target=0.975, gain_penalty=100.0, **kwargs):
         super().__init__(**kwargs)
-        self.core          = core
-        self.backoff       = backoff
-        self._memory_depth = memory_depth
-        self._snr_db       = snr_db
-
+        self.loss_mode, self.g_target, self.gain_penalty = loss_mode, g_target, gain_penalty
+        self.core, self.backoff, self.ref_power = core, backoff, ref_power
+        self._memory_depth, self._snr_db = memory_depth, snr_db
     def set_curriculum(self, memory_depth, snr_db):
-        self._memory_depth = memory_depth
-        self._snr_db       = snr_db
-
+        self._memory_depth, self._snr_db = memory_depth, snr_db
     def call(self, inputs, training=False):
         return self.core(inputs, training=training)
-
     def compile(self, optimizer, **kwargs):
         super().compile(**kwargs)
         self.optimizer = optimizer
-        self.loss_tracker = {"loss": tf.keras.metrics.Mean(name="loss")}
-
+        self.loss_tracker = {"loss": tf.keras.metrics.Mean(name="loss"),
+                             "gain": tf.keras.metrics.Mean(name="gain")}
     @property
     def metrics(self):
         return list(self.loss_tracker.values())
-
+    def _loss(self, x, training):
+        y = polynomial_tf(self.core(x, training=training), backoff=self.backoff, snr_db=self._snr_db,
+                          memory_depth=self._memory_depth, ref_power=self.ref_power)
+        return dla_loss(x, y, self.loss_mode, self.g_target, self.gain_penalty)
     def train_step(self, data):
-        x, y = data
+        x, _ = data
         with tf.GradientTape() as tape:
-            predistorted = self.core(x, training=True)
-            hpa_output = polynomial_tf(
-                predistorted, backoff=self.backoff,
-                snr_db=self._snr_db, memory_depth=self._memory_depth)
-            loss = tf.reduce_mean(tf.square(x - hpa_output))
+            loss, g_abs = self._loss(x, True)
         grads = tape.gradient(loss, self.core.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.core.trainable_weights))
         self.loss_tracker["loss"].update_state(loss)
+        self.loss_tracker["gain"].update_state(g_abs)
         return {k: v.result() for k, v in self.loss_tracker.items()}
-
     def test_step(self, data):
-        x, y = data
-        predistorted = self.core(x, training=False)
-        hpa_output = polynomial_tf(
-            predistorted, backoff=self.backoff,
-            snr_db=self._snr_db, memory_depth=self._memory_depth)
-        loss = tf.reduce_mean(tf.square(x - hpa_output))
+        x, _ = data
+        loss, g_abs = self._loss(x, False)
         self.loss_tracker["loss"].update_state(loss)
+        self.loss_tracker["gain"].update_state(g_abs)
         return {k: v.result() for k, v in self.loss_tracker.items()}
 
 
@@ -178,223 +155,224 @@ class TransformerDPD_DLA(models.Model):
 # ============================================================
 N          = 64
 seq_len    = N
-back_off   = 1            # ★ 데이터 생성과 동일 (16QAM)
-batch_size = N * 2
+back_off   = PA_IBO_DB  # IBO [dB] (포화 기준, dvae_curriculum.py에서 정의)
+batch_size = _mod.EXP_BATCH_SIZE      # dvae_curriculum.py의 실험 설정
+K_ORDERS   = (2, 4)     # 3, 5차 기저
+Q_DEPTH    = 3          # q = 0, 1, 2
+REF_POWER  = 1.0        # PA 기준 전력 (정규화된 원신호의 평균 전력)
+SAVE_INTERVAL     = _mod.EXP_SAVE_INTERVAL
+USE_CURRICULUM    = _mod.EXP_USE_CURRICULUM
+DATA_FRACTION     = _mod.EXP_DATA_FRACTION
+CURRICULUM_STAGES = _mod.exp_stages()
 
-d_model    = 64
-num_heads  = 4
-ff_dim     = 128
-num_layers = 2
-K_ORDERS   = (2, 4)
-Q_DEPTH    = 3
+# DLA 손실 (dvae_curriculum.dla_loss)
+#   'fixed'     : mean|G_FIX·x - y|^2  (목표 이득 G_FIX는 PA 차수에 따라 dvae_curriculum.py에서 정함)
+#   'gain_free' : 분석용 (같은 출력 이득에서는 fixed와 최적점이 같고 학습이 불안정 — 권장하지 않음)
+LOSS_MODE    = 'fixed'
+G_TARGET     = 0.975
+GAIN_PENALTY = 100.0
+LOSS_TAG     = '' if LOSS_MODE == 'fixed' else '_gainfree'
 
-# 커리큘럼: memory_depth 단계적 증가, 훈련 중 노이즈 없음
-CURRICULUM_STAGES = {
-    0: {"memory_depth": 0, "snr_db": -1.0, "total_epochs": 30, "init_lr": 1e-3},
-    1: {"memory_depth": 1, "snr_db": -1.0, "total_epochs": 30, "init_lr": 5e-4},
-    2: {"memory_depth": 2, "snr_db": -1.0, "total_epochs": 40, "init_lr": 2.5e-4},
-}
-SAVE_INTERVAL = 5
-model_dir = '/content/drive/MyDrive/NonlinearMemory/'
+CKPT_PREFIX = _mod.ckpt_prefix('transformer') + LOSS_TAG
+HISTORY_CSV = os.path.join(MODEL_DIR, f'training_history_{CKPT_PREFIX}.csv')
+print(f"체크포인트 접두어: {CKPT_PREFIX}, 배치 {batch_size}, 데이터 비율 {DATA_FRACTION}, 커리큘럼 {USE_CURRICULUM}")
 
-# ============================================================
-# 데이터 로드 (원본 신호만 — DLA)
-# ============================================================
-file_I = '/content/drive/MyDrive/input_target_I.csv'
-file_Q = '/content/drive/MyDrive/input_target_Q.csv'
 
-outputData_I = pd.read_csv(file_I, header=None).to_numpy()
-outputData_Q = pd.read_csv(file_Q, header=None).to_numpy()
-print(f"outputData_I shape: {outputData_I.shape}")
-
-for nm, arr in [("I", outputData_I), ("Q", outputData_Q)]:
-    if arr.shape[0] % seq_len != 0:
-        raise ValueError(f"{nm} samples ({arr.shape[0]}) not divisible by {seq_len}")
-
-outputData_I = outputData_I.reshape(-1, seq_len)
-outputData_Q = outputData_Q.reshape(-1, seq_len)
-len_i = outputData_I.shape[0]
-print(f"총 시퀀스 수: {len_i}")
-
-n_val   = int(0.1 * len_i)
-n_train = int(0.8 * len_i)
-
-train_I = outputData_I[:n_train];          train_Q = outputData_Q[:n_train]
-val_I   = outputData_I[n_train:n_train+n_val]; val_Q = outputData_Q[n_train:n_train+n_val]
-test_I  = outputData_I[n_train+n_val:];    test_Q  = outputData_Q[n_train+n_val:]
-
-_, _, rms_train = normalize_with_rms(train_I, train_Q)
-print(f"rms_train: {rms_train:.6f}")
-
-X_in_train_ch = to_1ch(train_I/rms_train, train_Q/rms_train)
-X_in_val_ch   = to_1ch(val_I/rms_train,   val_Q/rms_train)
-X_in_test_ch  = to_1ch(test_I/rms_train,  test_Q/rms_train)
-# y는 더미 (DLA에서 미사용)
-print(f"X_in_train_ch.shape: {X_in_train_ch.shape}")
-
-# ============================================================
-# 모델 생성
-# ============================================================
-core = build_transformer_dpd(seq_len, d_model, num_heads, ff_dim, num_layers,
-                             k_orders=K_ORDERS, q_depth=Q_DEPTH)
-model = TransformerDPD_DLA(core, backoff=float(back_off),
-                           memory_depth=CURRICULUM_STAGES[0]["memory_depth"],
-                           snr_db=CURRICULUM_STAGES[0]["snr_db"])
-model.compile(optimizer=tf.keras.optimizers.Adam(
-    CURRICULUM_STAGES[0]["init_lr"], clipnorm=1.0))
-model.build((None, seq_len, 2))
-core.summary()
-
-# ============================================================
-# Gradient 확인 (DLA)
-# ============================================================
-print("\n--- Gradient 흐름 확인 ---")
-sx = tf.constant(X_in_train_ch[:128])
-with tf.GradientTape() as tape:
-    pred = core(sx, training=True)
-    hpa  = polynomial_tf(pred, backoff=float(back_off), snr_db=-1.0,
-                         memory_depth=CURRICULUM_STAGES[0]["memory_depth"])
-    lc   = tf.reduce_mean(tf.square(sx - hpa))
-gc = tape.gradient(lc, core.trainable_variables)
-gn = [tf.norm(g).numpy() for g in gc if g is not None]
-print(f"gradient 최소: {min(gn):.2e}")
-print(f"gradient 최대: {max(gn):.2e}")
-print(f"gradient가 0인 레이어 수: {sum(1 for g in gn if g < 1e-10)}")
-print("--------------------------\n")
-
-# ============================================================
-# EVM 모니터 (추론 EVM과 동일 정의)
-# ============================================================
-class EVMMonitor(tf.keras.callbacks.Callback):
-    def __init__(self, sample_x, backoff, md_getter):
-        self.sx = tf.constant(sample_x[:128])
-        self.bo = backoff
-        self.get_md = md_getter
-
-    def on_epoch_end(self, epoch, logs=None):
-        pred = self.model.core(self.sx, training=False)
-        md   = self.get_md()
-        hpa  = polynomial_tf(pred, backoff=self.bo, snr_db=-1.0, memory_depth=md)
-        den  = tf.reduce_mean(tf.square(self.sx))
-        evm  = (tf.sqrt(tf.reduce_mean(tf.square(self.sx - hpa)) / den) * 100).numpy()
-        hpa0 = polynomial_tf(self.sx, backoff=self.bo, snr_db=-1.0, memory_depth=md)
-        evm0 = (tf.sqrt(tf.reduce_mean(tf.square(self.sx - hpa0)) / den) * 100).numpy()
-        corr = pred - self.sx
-        mag  = tf.reduce_mean(tf.abs(corr)).numpy()
-        loss = logs.get('loss', 0); vl = logs.get('val_loss', 0)
-        lr   = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
-        flag = "✓ 개선" if evm < evm0 else "✗ 악화"
-        print(f"\n[Epoch {epoch+1}] correction={mag:.4f} | "
-              f"EVM(DPD)={evm:.2f}% vs EVM(HPA)={evm0:.2f}% {flag} | "
-              f"loss={loss:.2e} | val_loss={vl:.2e} | lr={lr:.2e}")
-
-evm_monitor = EVMMonitor(X_in_train_ch, float(back_off), lambda: model._memory_depth)
-
-lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
-    monitor='val_loss', factor=0.5, patience=5, min_lr=1e-5, verbose=1)
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor='val_loss', patience=10, restore_best_weights=True, verbose=1)
-
-# ============================================================
-# Resume 탐색
-# ============================================================
-def find_latest_ckpt(model_dir):
-    pat = re.compile(r'transformer_dla_stage(\d+)_epoch(\d+)\.weights\.h5')
+def find_latest_checkpoint(model_dir, prefix):
+    pattern = re.compile(re.escape(prefix) + r'_stage(\d+)_epoch(\d+)\.weights\.h5')
     cands = []
-    for f in os.listdir(model_dir):
-        m = pat.match(f)
+    for fname in os.listdir(model_dir):
+        m = pattern.fullmatch(fname)
         if m:
-            cands.append((int(m.group(1)), int(m.group(2)), os.path.join(model_dir, f)))
+            cands.append((int(m.group(1)), int(m.group(2)), os.path.join(model_dir, fname)))
     if not cands:
         return 0, 0, None
     cands.sort(key=lambda t: (t[0], t[1]))
     return cands[-1]
 
-resume_stage, resume_epoch_in_stage, resume_path = find_latest_ckpt(model_dir)
-
-if resume_path is not None:
-    print(f"\n저장된 가중치 발견: {resume_path}")
-    _ = core(tf.constant(X_in_train_ch[:N]), training=False)
-    model.load_weights(resume_path)
-    model.set_curriculum(
-        memory_depth=CURRICULUM_STAGES[resume_stage]["memory_depth"],
-        snr_db=CURRICULUM_STAGES[resume_stage]["snr_db"])
-    print(f"훈련 재개: Stage {resume_stage}")
-else:
-    print("\n저장된 가중치 없음 — Stage 0부터 새로 훈련합니다.")
 
 # ============================================================
-# 커리큘럼 훈련 루프
+# 데이터 로드 (원신호만 사용, 물리적 시간 순서의 스트림)
+# ============================================================
+outputData_I = pd.read_csv(os.path.join(BASE_DIR, 'input_target_I.csv'), header=None).to_numpy()
+outputData_Q = pd.read_csv(os.path.join(BASE_DIR, 'input_target_Q.csv'), header=None).to_numpy()
+if outputData_I.shape[0] % seq_len != 0:
+    raise ValueError(f"샘플 수({outputData_I.shape[0]})가 seq_len({seq_len})의 배수가 아닙니다.")
+
+# 연속된 64샘플씩 시퀀스로 자름
+outputData_I = outputData_I.reshape(-1, seq_len)
+outputData_Q = outputData_Q.reshape(-1, seq_len)
+if DATA_FRACTION < 1.0:                     # 학습 예산 제한: 앞부분 연속 구간만 사용
+    n_use = int(DATA_FRACTION * outputData_I.shape[0])
+    outputData_I, outputData_Q = outputData_I[:n_use], outputData_Q[:n_use]
+len_i   = outputData_I.shape[0]
+n_train = int(0.8 * len_i)
+n_val   = int(0.1 * len_i)
+print(f"총 시퀀스 수: {len_i} (train {n_train}, val {n_val}, test {len_i - n_train - n_val})")
+
+_, _, rms_train = normalize_with_rms(outputData_I[:n_train], outputData_Q[:n_train])
+print(f"rms_train: {rms_train:.6f}")
+
+def split(a, b):
+    return to_1ch(a / rms_train, b / rms_train)
+
+X_in_train_ch = split(outputData_I[:n_train],               outputData_Q[:n_train])
+X_in_val_ch   = split(outputData_I[n_train:n_train + n_val], outputData_Q[n_train:n_train + n_val])
+X_in_test_ch  = split(outputData_I[n_train + n_val:],        outputData_Q[n_train + n_val:])
+print(f"정규화된 학습 신호 평균 전력: {np.mean(np.sum(X_in_train_ch**2, axis=-1)):.6f} (1이어야 함)")
+
+
+# ============================================================
+# 모델 생성
+# ============================================================
+dvae = TransformerDPD_DLA(
+    core         = build_transformer_dpd(seq_len, k_orders=K_ORDERS, q_depth=Q_DEPTH),
+    backoff      = float(back_off),
+    memory_depth = CURRICULUM_STAGES[0]["memory_depth"],
+    snr_db       = CURRICULUM_STAGES[0]["snr_db"],
+    ref_power    = REF_POWER,
+    loss_mode    = LOSS_MODE,
+    g_target     = G_TARGET,
+    gain_penalty = GAIN_PENALTY,
+)
+print(f"DLA 손실: {LOSS_MODE}" + (f" (G_TARGET {G_TARGET}, 벌점 {GAIN_PENALTY})" if LOSS_MODE != 'fixed' else "")
+      + f", 체크포인트 접두어 '{CKPT_PREFIX}'")
+dvae.compile(optimizer=tf.keras.optimizers.Adam(CURRICULUM_STAGES[0]["init_lr"], clipnorm=1.0))
+dvae.build((None, seq_len, 2))
+_ = dvae.core(tf.zeros((1, seq_len, 2)))
+print(f"총 파라미터 수: {dvae.core.count_params():,}")
+
+# 기울기 흐름 확인
+sample_x = tf.constant(X_in_train_ch[:128])
+with tf.GradientTape() as tape:
+    pred = dvae(sample_x, training=True)
+    loss_check, _ = dla_loss(sample_x, polynomial_tf(
+        pred, backoff=float(back_off), memory_depth=CURRICULUM_STAGES[0]["memory_depth"],
+        ref_power=REF_POWER), LOSS_MODE, G_TARGET, GAIN_PENALTY)
+grad_norms = [tf.norm(g).numpy() for g in tape.gradient(loss_check, dvae.trainable_variables)
+              if g is not None]
+print(f"gradient 최소 {min(grad_norms):.2e}, 최대 {max(grad_norms):.2e}, "
+      f"0인 레이어 {sum(1 for g in grad_norms if g < 1e-10)}개\n")
+
+
+# ============================================================
+# 콜백
+# ============================================================
+def evm_percent(x, y):
+    return float(tf.sqrt(tf.reduce_mean(tf.square(x - y)) / tf.reduce_mean(tf.square(x))) * 100.0)
+
+def evm_gain_norm(x, y):
+    """이득 정규화 EVM [%]과 |g| (평가 파일 evm_pct와 같은 정의, 시간 영역)"""
+    xc = tf.complex(x[..., 0], x[..., 1]); yc = tf.complex(y[..., 0], y[..., 1])
+    g  = tf.reduce_sum(tf.math.conj(xc) * yc) / tf.cast(tf.reduce_sum(tf.abs(xc) ** 2), tf.complex64)
+    e  = tf.reduce_mean(tf.abs(yc / g - xc) ** 2) / tf.reduce_mean(tf.abs(xc) ** 2)
+    return float(tf.sqrt(e) * 100.0), float(tf.abs(g))
+
+class EVMHistory(tf.keras.callbacks.Callback):
+    """매 epoch 검증 데이터로 전체 모델(Q = 2) 기준 EVM을 계산하고 CSV에 기록"""
+    def __init__(self, val_x, backoff, ref_power, csv_path):
+        super().__init__()
+        self.val_x, self.backoff, self.ref_power, self.csv_path = \
+            tf.constant(val_x), backoff, ref_power, csv_path
+        self.stage = 0
+        self.global_epoch = 0
+        if os.path.exists(csv_path):                       # 재개 시 이어서 기록
+            self.global_epoch = max(0, sum(1 for _ in open(csv_path)) - 1)
+        else:
+            with open(csv_path, 'w', newline='') as f:
+                csv.writer(f).writerow(['global_epoch', 'stage', 'memory_depth', 'loss', 'val_loss',
+                                        'lr', 'evm_dpd_full_pct', 'evm_hpa_full_pct',
+                                        'evm_dpd_gn_pct', 'evm_hpa_gn_pct', 'gain_dpd', 'gain_hpa'])
+        hpa0 = polynomial_tf(self.val_x, backoff=backoff, memory_depth=2, ref_power=ref_power)
+        self.evm_hpa = evm_percent(self.val_x, hpa0)
+        self.evm_hpa_gn, self.g_hpa = evm_gain_norm(self.val_x, hpa0)
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.global_epoch += 1
+        pred = self.model(self.val_x, training=False)
+        y    = polynomial_tf(pred, backoff=self.backoff, memory_depth=2, ref_power=self.ref_power)
+        evm  = evm_percent(self.val_x, y)
+        evm_gn, g = evm_gain_norm(self.val_x, y)
+        lr   = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+        loss, vloss = logs.get('loss', np.nan), logs.get('val_loss', np.nan)
+        with open(self.csv_path, 'a', newline='') as f:
+            csv.writer(f).writerow([self.global_epoch, self.stage + 1, self.model._memory_depth,
+                                    f'{loss:.6e}', f'{vloss:.6e}', f'{lr:.3e}',
+                                    f'{evm:.4f}', f'{self.evm_hpa:.4f}',
+                                    f'{evm_gn:.4f}', f'{self.evm_hpa_gn:.4f}', f'{g:.4f}', f'{self.g_hpa:.4f}'])
+        print(f"\n[Stage {self.stage + 1}, epoch {epoch + 1}] EVM(Q=2, 이득 정규화) DPD {evm_gn:.2f}% "
+              f"(|g| {g:.4f}) vs HPA {self.evm_hpa_gn:.2f}% (|g| {self.g_hpa:.4f}) | 비정규화 DPD {evm:.2f}% "
+              f"| loss {loss:.2e} | val_loss {vloss:.2e} | lr {lr:.2e}")
+
+class PeriodicSaver(tf.keras.callbacks.Callback):
+    """단계 안에서 SAVE_INTERVAL epoch마다 가중치 저장"""
+    def __init__(self, model_dir, prefix, interval):
+        super().__init__()
+        self.model_dir, self.prefix, self.interval, self.stage = model_dir, prefix, interval, 0
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.interval == 0:
+            path = os.path.join(self.model_dir, f"{self.prefix}_stage{self.stage}_epoch{epoch + 1}.weights.h5")
+            self.model.save_weights(path)
+            print(f"저장: {path}")
+
+history_cb = EVMHistory(X_in_val_ch[:512], float(back_off), REF_POWER, HISTORY_CSV)
+saver_cb   = PeriodicSaver(MODEL_DIR, CKPT_PREFIX, SAVE_INTERVAL)
+
+
+# ============================================================
+# 재개
+# ============================================================
+scheduler = CurriculumScheduler()
+resume_stage, resume_epoch, resume_path = find_latest_checkpoint(MODEL_DIR, CKPT_PREFIX)
+if resume_path is not None:
+    print(f"저장된 가중치 발견: {resume_path} → 이어서 학습")
+    dvae.load_weights(resume_path)
+    if USE_CURRICULUM:
+        for _ in range(resume_stage):
+            scheduler.advance()
+else:
+    print("저장된 가중치 없음 — 처음부터 학습합니다.")
+
+
+# ============================================================
+# 학습 루프 (단계마다 fit 한 번)
 # ============================================================
 for stage_idx in range(resume_stage, len(CURRICULUM_STAGES)):
     cfg = CURRICULUM_STAGES[stage_idx]
-    total_epochs = cfg["total_epochs"]
-    stage_init_lr = cfg["init_lr"]
-
-    model.set_curriculum(memory_depth=cfg["memory_depth"], snr_db=cfg["snr_db"])
-    print(f"\n현재 Stage {stage_idx} | memory={cfg['memory_depth']}tap")
-
-    model.optimizer.learning_rate = stage_init_lr
-    print(f"LR 초기화: {stage_init_lr:.2e}")
-
-    early_stopping.best = np.inf; early_stopping.wait = 0
-    early_stopping.stopped_epoch = 0
-    lr_scheduler.best = np.inf; lr_scheduler.wait = 0
-    lr_scheduler.cooldown_counter = 0
-
-    epoch_start = resume_epoch_in_stage if stage_idx == resume_stage else 0
-    resume_epoch_in_stage = 0
-
-    if epoch_start >= total_epochs:
-        print(f"Stage {stage_idx} 이미 완료 — 다음으로")
+    epoch_start = resume_epoch if stage_idx == resume_stage else 0
+    if epoch_start >= cfg["total_epochs"]:
+        print(f"Stage {stage_idx + 1}는 이미 완료 — 다음 단계로")
+        if USE_CURRICULUM:
+            scheduler.advance()
         continue
 
-    save_points = list(range(((epoch_start // SAVE_INTERVAL) + 1) * SAVE_INTERVAL,
-                             total_epochs + 1, SAVE_INTERVAL))
-    if not save_points or save_points[-1] < total_epochs:
-        save_points.append(total_epochs)
+    dvae.set_curriculum(memory_depth=cfg["memory_depth"], snr_db=cfg["snr_db"])
+    # 중요: Keras는 첫 fit에서 train/test 함수를 tf.function으로 컴파일해 재사용한다.
+    # memory_depth는 파이썬 값이라 컴파일 시점의 값(Q = 0)이 그래프에 고정되므로,
+    # 단계를 바꿀 때마다 함수를 버려 새 Q로 다시 컴파일되게 한다.
+    # (이 두 줄이 없으면 2·3단계도 실제로는 Q = 0 PA로 학습된다)
+    dvae.train_function = None
+    dvae.test_function = None
+    dvae.optimizer.learning_rate = cfg["init_lr"]            # 단계 시작 시 학습률 초기화
+    history_cb.stage = saver_cb.stage = stage_idx
+    print(f"\n[Stage {stage_idx + 1}] Q = {cfg['memory_depth']}, epoch {epoch_start + 1}~"
+          f"{cfg['total_epochs']}, 초기 학습률 {cfg['init_lr']:.2e}")
 
-    for save_epoch in save_points:
-        epochs_to_run = save_epoch - epoch_start
-        if epochs_to_run <= 0:
-            continue
-        print(f"\n[Stage {stage_idx}] {epoch_start+1}~{save_epoch} epoch "
-              f"(memory={cfg['memory_depth']}tap, LR_init={stage_init_lr:.2e})")
+    lr_scheduler   = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                                          patience=5, min_lr=1e-5, verbose=1)
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10,
+                                                      restore_best_weights=True, verbose=1)
+    dvae.fit(X_in_train_ch, X_in_train_ch,
+             validation_data=(X_in_val_ch, X_in_val_ch),
+             initial_epoch=epoch_start, epochs=cfg["total_epochs"], batch_size=batch_size,
+             callbacks=[history_cb, saver_cb, lr_scheduler, early_stopping], verbose=1)
 
-        model.fit(X_in_train_ch, X_in_train_ch,
-                  validation_data=(X_in_val_ch, X_in_val_ch),
-                  epochs=epochs_to_run, batch_size=batch_size,
-                  callbacks=[evm_monitor, lr_scheduler, early_stopping],
-                  verbose=1)
+    # 단계 종료 시점의 가중치(조기 종료 시 최적 epoch로 복원된 값)를 단계 마지막 번호로 저장
+    final_path = os.path.join(MODEL_DIR, f"{CKPT_PREFIX}_stage{stage_idx}_epoch{cfg['total_epochs']}.weights.h5")
+    dvae.save_weights(final_path)
+    print(f"단계 완료, 저장: {final_path}")
+    print("Test set 평가:", dvae.evaluate(X_in_test_ch, X_in_test_ch, verbose=0))
+    if USE_CURRICULUM:
+        scheduler.advance()
 
-        sp = os.path.join(model_dir,
-                          f"transformer_dla_stage{stage_idx}_epoch{save_epoch}.weights.h5")
-        model.save_weights(sp)
-        print(f"저장 완료: {sp}")
-        print(f"Test 평가 (Stage {stage_idx}, epoch {save_epoch}):")
-        model.evaluate(X_in_test_ch, X_in_test_ch, verbose=1)
-
-        if early_stopping.stopped_epoch > 0:
-            print(f"Early stopping — Stage {stage_idx} 종료")
-            break
-        epoch_start = save_epoch
-
-# ============================================================
-# 최종 평가
-# ============================================================
-print("\n" + "="*55)
-print("훈련 완료 — 최종 test 평가")
-print("="*55)
-model.evaluate(X_in_test_ch, X_in_test_ch, verbose=1)
-
-# 최종 EVM
-sx = tf.constant(X_in_test_ch[:2000])
-pred = core(sx, training=False)
-hpa  = polynomial_tf(pred, backoff=float(back_off), snr_db=-1.0, memory_depth=2)
-hpa0 = polynomial_tf(sx,   backoff=float(back_off), snr_db=-1.0, memory_depth=2)
-den  = tf.reduce_mean(tf.square(sx))
-evm  = (tf.sqrt(tf.reduce_mean(tf.square(sx - hpa)) / den) * 100).numpy()
-evm0 = (tf.sqrt(tf.reduce_mean(tf.square(sx - hpa0)) / den) * 100).numpy()
-print(f"\n최종 EVM (보상 없음, HPA): {evm0:.4f}%")
-print(f"최종 EVM (Transformer DPD): {evm:.4f}%")
-print(f"{'✓ DPD 성공' if evm < evm0 else '✗ DPD 실패'}")
+print("\n학습 완료. 학습 곡선 기록:", HISTORY_CSV)
