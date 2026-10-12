@@ -38,6 +38,13 @@ MODELS     = ['vtae', 'transformer', 'transformer_conv']   # 평가할 모델 (�
 #   'transformer'      : 같은 학습 체계(물리 기저, 잔차, DLA, 커리큘럼)의 Transformer — 백본만 다른 절제 비교
 #   'transformer_conv' : 일반적인 Transformer DPD (Transformer_DPD_conventional.py) — 문헌 기준선
 #   학습하지 않은 모델은 목록에서 빼면 된다.
+
+# 특정 체크포인트를 쓰고 싶을 때 파일 이름을 지정 (없으면 자동으로 마지막 체크포인트)
+CKPT_OVERRIDE = {
+    'vtae': 'vtae_pa5_ibo8_b512_f0.02_nocur_stage0_epoch100.weights.h5',   # 실제 파일 이름으로 바꾸기
+    # 'transformer': '...',
+}
+
 BASE_DIR   = '/content/drive/MyDrive/NonlinearMemory'
 MODEL_DIR  = os.path.join(BASE_DIR, 'vt-ae')
 LOSS_TAG   = ''            # 학습 파일 LOSS_MODE가 'fixed'면 '' ('gain_free'면 '_gainfree')
@@ -288,7 +295,12 @@ dpd_out = {}
 for mt in MODELS:
     nets[mt] = build_model(mt)
     ckpts[mt] = list_checkpoints(MODEL_DIR, _mod.ckpt_prefix(mt) + LOSS_TAG)
-    last_ep, w_path = list(ckpts[mt].items())[-1]
+    #last_ep, w_path = list(ckpts[mt].items())[-1]
+    if mt in CKPT_OVERRIDE:
+        w_path  = os.path.join(MODEL_DIR, CKPT_OVERRIDE[mt])
+        last_ep = int(re.search(r'epoch(\d+)', w_path).group(1))
+    else:
+        last_ep, w_path = list(ckpts[mt].items())[-1]
     nets[mt][0].load_weights(w_path)
     print(f"[{mt}] 가중치 로드: {os.path.basename(w_path)} (전체 epoch {last_ep})")
     dpd_out[mt] = run_dpd(nets[mt][1], IQ_out_r, rms)
