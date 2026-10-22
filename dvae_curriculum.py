@@ -29,6 +29,7 @@ dvae_curriculum.py  — 실험 설정(PA 차수, IBO, 목표 이득, 배치, 데
                  (fixed = |1-g|^2 + |d|^2, gain_free = |d|^2/|g|^2, d는 x와 무상관인 왜곡).
                  즉 이 손실은 성능 향상이라기보다 '출력 이득(전력)을 지정해 학습'하는 도구다.
 """
+import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
@@ -51,13 +52,13 @@ EXP_BATCH_SIZE     = 512     # 배치 (64샘플 시퀀스 개수)
 EXP_DATA_FRACTION  = 0.02    # 학습 데이터 중 사용할 비율 (앞에서부터 연속 구간)
                              # 0.02 → 약 8,000 시퀀스, 배치 512에서 epoch당 약 12회 갱신 (학습 예산 제한 조건)
                              # 1.0  → 전체 데이터
-EXP_USE_CURRICULUM = True
+EXP_USE_CURRICULUM = False   # 논문 조건: 커리큘럼 없음
 EXP_STAGES_CURRICULUM = {    # 단계: (memory depth Q, epoch 수, 초기 학습률)
-    0: (0, 30, 1e-3),
-    1: (1, 30, 5e-4),
-    2: (2, 40, 2.5e-4),
+    0: (0, 10, 1e-3),
+    1: (1, 10, 5e-4),
+    2: (2, 20, 2.5e-4),
 }
-EXP_STAGES_NOCURRICULUM = {0: (2, 100, 1e-3)}
+EXP_STAGES_NOCURRICULUM = {0: (2, 100, 1e-3)}   # 논문 조건: Q = 2, 100 epoch, 학습률 1e-3
 EXP_SAVE_INTERVAL = 10       # 체크포인트 저장 간격 (단계 안의 epoch 기준)
 
 def exp_stages():
@@ -65,9 +66,26 @@ def exp_stages():
     return {k: {"memory_depth": q, "snr_db": -1.0, "total_epochs": e, "init_lr": lr}
             for k, (q, e, lr) in st.items()}
 
-def exp_tag():
+# 반복 학습 (초기 가중치에 따른 편차 확인)
+#   EXP_SEED = None : seed를 고정하지 않음. 체크포인트 이름에 seed가 붙지 않음 (기존 학습 결과 = 1회차)
+#   EXP_SEED = 2, 3, ... : tf.keras.utils.set_random_seed(seed)로 가중치 초기값·미니배치 순서·dropout을 고정하고
+#                          체크포인트 이름 끝에 _s2, _s3 ...를 붙인다 (기존 가중치를 덮어쓰지 않음)
+#   Colab에서 파일을 고치지 않고 바꾸려면 os.environ['EXP_SEED'] = '3' 처럼 환경변수로 지정해도 된다.
+EXP_SEED = None
+if os.environ.get('EXP_SEED'):
+    EXP_SEED = int(os.environ['EXP_SEED'])
+EXP_SEEDS_EVAL = [None, 2, 3, 4, 5]   # 평가 파일에서 평균·표준편차를 낼 seed 목록 (None = 기존 학습)
+
+def seed_suffix():
+    return '' if EXP_SEED is None else f'_s{EXP_SEED}'
+
+def base_tag():
+    """seed를 뺀 실험 이름 (같은 조건의 반복 학습들이 공유)"""
     return (f"pa{PA_ORDER}_ibo{PA_IBO_DB:g}_b{EXP_BATCH_SIZE}_f{EXP_DATA_FRACTION:g}_"
             f"{'cur' if EXP_USE_CURRICULUM else 'nocur'}")
+
+def exp_tag():
+    return base_tag() + seed_suffix()
 
 # 일반적인 Transformer DPD (문헌 기준선, Transformer_DPD_conventional.py)
 #   물리 기저 없음, 잔차 출력 없음, 커리큘럼 없음.  학습 방식은 아래에서 선택
@@ -81,10 +99,10 @@ EXP_CONV_ILA_ITERS  = 4          # ILA 반복 횟수 (전체 epoch를 나눠 씀
 def ckpt_prefix(model_type):
     """체크포인트 파일 접두어 — 설정이 다르면 이름이 달라져 서로 섞이지 않는다"""
     base = {'vtae': 'vtae', 'transformer': 'transformer', 'transformer_conv': 'transformer_conv'}[model_type]
-    tag = exp_tag()
+    tag = base_tag()
     if model_type == 'transformer_conv':          # 커리큘럼을 쓰지 않으므로 학습 방식·입력으로 구분
         tag = tag.rsplit('_', 1)[0] + f"_{EXP_CONV_TRAIN_MODE}_{EXP_CONV_INPUT}"
-    return base + '_' + tag
+    return base + '_' + tag + seed_suffix()           # seed는 맨 끝 (_s2 ...)
 
 def total_epochs():
     return sum(cfg["total_epochs"] for cfg in exp_stages().values())
