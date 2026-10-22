@@ -30,7 +30,7 @@ import importlib.util, shutil
 # 경로 설정, dvae_curriculum.py 로드
 # ============================================================
 BASE_DIR  = '/content/drive/MyDrive/NonlinearMemory'
-MODEL_DIR = os.path.join(BASE_DIR, 'transformer')
+MODEL_DIR = os.path.join(BASE_DIR, 'vt-ae')
 
 _dvae_path = os.path.join(BASE_DIR, 'dvae_curriculum.py')
 _pycache   = os.path.join(BASE_DIR, '__pycache__')
@@ -45,6 +45,10 @@ _spec.loader.exec_module(_mod)
 polynomial_tf = _mod.polynomial_tf
 polynomial_np = _mod.polynomial_np
 print(f"실험 설정: {_mod.exp_tag()}, A_SAT {_mod.A_SAT:.3f}, 목표 이득 G {_mod.G_FIX}")
+
+if _mod.EXP_SEED is not None:      # 반복 학습: 가중치 초기값·미니배치 순서·dropout을 seed로 고정
+    tf.keras.utils.set_random_seed(_mod.EXP_SEED)
+print(f"학습 seed: {_mod.EXP_SEED if _mod.EXP_SEED is not None else '고정 안 함 (1회차)'}")
 
 
 # ============================================================
