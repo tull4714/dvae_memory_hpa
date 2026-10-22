@@ -35,12 +35,12 @@ import importlib.util, shutil
 # ============================================================
 # 경로 설정
 # ============================================================
-BASE_DIR  = '/content/drive/MyDrive'
-MODEL_DIR = os.path.join(BASE_DIR, 'NonlinearMemory')
+BASE_DIR  = '/content/drive/MyDrive/NonlinearMemory'
+MODEL_DIR = os.path.join(BASE_DIR, 'vt-ae')
 
 # dvae_curriculum.py를 파일 경로로 직접 로드 (패키지/캐시 문제 회피)
-_dvae_path = os.path.join(MODEL_DIR, 'dvae_curriculum.py')
-_pycache   = os.path.join(MODEL_DIR, '__pycache__')
+_dvae_path = os.path.join(BASE_DIR, 'dvae_curriculum.py')
+_pycache   = os.path.join(BASE_DIR, '__pycache__')
 if os.path.exists(_pycache):
     shutil.rmtree(_pycache)
 for _key in list(sys.modules.keys()):
@@ -57,6 +57,10 @@ polynomial_tf       = _mod.polynomial_tf
 PA_IBO_DB           = _mod.PA_IBO_DB
 dla_loss            = _mod.dla_loss
 print(f"실험 설정: {_mod.exp_tag()}, A_SAT {_mod.A_SAT:.3f}, 목표 이득 G {_mod.G_FIX}")
+
+if _mod.EXP_SEED is not None:      # 반복 학습: 가중치 초기값·미니배치 순서·dropout을 seed로 고정
+    tf.keras.utils.set_random_seed(_mod.EXP_SEED)
+print(f"학습 seed: {_mod.EXP_SEED if _mod.EXP_SEED is not None else '고정 안 함 (1회차)'}")
 print("dvae_curriculum 직접 로드 성공")
 
 
